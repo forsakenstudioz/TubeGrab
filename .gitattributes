@@ -1,0 +1,5 @@
+# Normalise line endings in the repo
+* text=auto
+# Windows batch files must keep CRLF or cmd.exe misreads them
+*.bat text eol=crlf
+*.png binary

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# PyInstaller output
+build/
+dist/
+share/
+*.spec
+
+# Tools people drop next to the app (too big for git, and not ours)
+ffmpeg.exe
+ffprobe.exe
+deno.exe
+ffmpeg/
+
+# Test downloads / local junk
+downloads/
+links.txt
+.tubegrab-tmp/
+*.zip
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
