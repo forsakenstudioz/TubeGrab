@@ -1,12 +1,9 @@
 # TubeGrab
 
-A friendly Windows app for downloading YouTube videos, playlists and music, built on [yt-dlp](https://github.com/yt-dlp/yt-dlp).
-Paste links, press **Download**, done. No more `links.txt` + batch files.
+A friendly desktop app for downloading YouTube videos, playlists and music, built on [yt-dlp](https://github.com/yt-dlp/yt-dlp).
+Paste links, tick what you want, press **Download checked**. No more `links.txt` + batch files.
 
 ![TubeGrab screenshot](docs/screenshot.png)
-
-It runs on your own PC and opens in your browser at `http://127.0.0.1:8765`. Nothing is uploaded anywhere,
-and other devices or websites can't control it.
 
 ## Download
 
@@ -17,35 +14,49 @@ Go to **[Releases](../../releases/latest)** and get:
 
 Windows SmartScreen may warn about an unknown app the first time. Click **More info → Run anyway**.
 
-Keep the black console window open while downloading. Closing it (or **Settings → Quit**) stops TubeGrab.
+## How to use
 
-## Features
+1. **Paste your links** into box 1: videos, playlists, channels or Shorts, one per line. You can also use **Paste**, or **Import .txt…** for an old `links.txt`.
+2. **Format & save to**: pick *Video* (quality, MP4/MKV, subtitles) or *Audio only* (MP3, M4A, Opus, FLAC, WAV), and the folder.
+3. **Choose what to download**: press **Load links** (or Ctrl+Enter) to see every video. Tick or untick items. Playlists can be expanded to pick single videos.
+   - Click a link's **Format** cell (or right-click it) to download just that link as audio or video.
+   - For a `watch?v=…&list=…` link only the video you opened is ticked; tick more if you want the rest.
+4. Press **Download checked**. Use **Pause**, **Stop** and **Open folder** as needed.
 
-- **Download** button (or Ctrl+Enter), plus **Paste**, **Import .txt** and drag-and-drop
-- 🎬 Video (best, 4K … 360p; MP4 or MKV) or 🎵 Audio (MP3, M4A, Opus, FLAC, WAV)
-- Playlists: choose a range or tick individual items; "just this video" for `watch?v=…&list=…` links
-- Live progress, speed, ETA, cancel / retry, several downloads at once
-- Subtitles (any languages), cover art, metadata and chapters embedded
-- Cuts out sponsor segments with SponsorBlock (optional)
-- Skips things you already downloaded
-- Uses your browser's cookies for age-restricted / "confirm you're not a bot" videos
-- Plain-English hints when something goes wrong, and a notice when a new TubeGrab version is out
+In a hurry? Paste links and press **Download checked** straight away. They're read and downloaded in one go.
 
-Videos are saved to `Downloads\TubeGrab`, audio to `Downloads\TubeGrab\Audio` (changeable in Settings).
+Videos are saved to `Downloads\TubeGrab`, audio to `Downloads\TubeGrab\Audio`.
+
+## Settings
+
+**Settings…** (top right) has the rest:
+
+| Setting | What it does |
+|---|---|
+| Subtitle languages | e.g. `en.*,ta,hi`, optionally auto-generated subtitles too |
+| Embed cover / metadata / chapters | Saved inside the file |
+| Cut out sponsor segments | Removes sponsor / self-promo / "subscribe" bits via SponsorBlock |
+| Playlists in their own folder, numbered files | `Playlist name/01 - Title.mp4` |
+| Skip things I already downloaded | Remembers finished items (separately for video and audio); *Forget download history* resets it |
+| Speed limit | e.g. `2M` so downloads don't hog the connection |
+| Use cookies from | For age-restricted / members-only / "confirm you're not a bot" errors (Firefox works best) |
+| Update yt-dlp | When running from source; YouTube changes often |
+
+Errors show up in the log with a tip on how to fix them.
 
 ## Run from source
 
-Needs Python 3.11+.
+Needs Python 3.11+ with Tkinter (included in the python.org installer). Works on Windows, macOS and Linux.
 
 ```bat
 Install-Tools.bat          :: once: FFmpeg + Deno (+ Python if missing) via winget
-Start-TubeGrab.bat         :: installs yt-dlp on first run, then starts the app
+Start-TubeGrab.bat         :: installs yt-dlp on first run, then opens the window
 ```
 
 Or manually: `pip install -U "yt-dlp[default]"`, then `python tubegrab.py`.
-Running from source lets you use **Settings → Update yt-dlp** whenever YouTube changes something.
+On Linux you may need your distro's Tk package (e.g. `sudo apt install python3-tk`).
 
-Run the tests with `pip install pytest` and then `python -m pytest -q`.
+Run the tests with `pip install pytest`, then `python -m pytest -q`.
 
 ## Making a new release (maintainers)
 
@@ -58,7 +69,7 @@ GitHub Actions builds everything on a Windows machine with the newest yt-dlp:
    git push origin v1.1.0
    ```
 3. A few minutes later the release appears with `TubeGrab.exe` and the portable zip attached.
-   The version number and repo name are stamped into the app automatically, so existing users get the "new version available" banner.
+   The version number and repo name are stamped into the app automatically, so existing users get a "new version available" notice.
 
 Because the .exe has yt-dlp built in, **make a new release whenever YouTube downloads start failing**. Even a release with no code changes picks up the latest yt-dlp.
 To test a build without releasing, open **Actions → Build & release → Run workflow** and download the result from the run's *Artifacts*.
@@ -69,13 +80,14 @@ You can also build locally with `build-exe.bat`.
 
 | File | What it is |
 |---|---|
-| `tubegrab.py` | The app: yt-dlp + a small local web server |
-| `ui.html` | The interface |
+| `tubegrab.py` | The desktop window (Tkinter) |
+| `tubegrab_core.py` | Everything that talks to yt-dlp: settings, reading links, downloading |
+| `assets/tubegrab.ico` | App icon |
 | `Start-TubeGrab.bat` / `Install-Tools.bat` / `build-exe.bat` | Windows helpers |
-| `tests/` | Smoke tests (option checks + a real local download) |
+| `tests/` | Tests, including real local downloads |
 | `.github/workflows/` | CI tests and the release build |
 
-Settings and the "already downloaded" lists live in `%APPDATA%\TubeGrab`.
+Settings and the download history live in `%APPDATA%\TubeGrab`.
 
 ## Credits
 

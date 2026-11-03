@@ -27,17 +27,17 @@ jobs:
         shell: python
         run: |
           import os, re, pathlib
-          p = pathlib.Path("tubegrab.py")
+          p = pathlib.Path("tubegrab_core.py")
           src = p.read_text("utf-8")
           ref = os.environ["GITHUB_REF_NAME"]
           if os.environ["GITHUB_REF_TYPE"] == "tag":
               src = re.sub(r'^APP_VERSION = ".*"', f'APP_VERSION = "{ref.lstrip("vV")}"', src, count=1, flags=re.M)
           src = re.sub(r'^GITHUB_REPO = ".*"', f'GITHUB_REPO = "{os.environ["GITHUB_REPOSITORY"]}"', src, count=1, flags=re.M)
           p.write_text(src, "utf-8")
-          print(re.findall(r'^(APP_VERSION|GITHUB_REPO) = .*', src, flags=re.M))
+          print(re.findall(r'^(?:APP_VERSION|GITHUB_REPO) = .*', src, flags=re.M))
 
-      - name: Build TubeGrab.exe
-        run: python -m PyInstaller --noconfirm --clean --onefile --name TubeGrab --add-data "ui.html;." tubegrab.py
+      - name: Build TubeGrab.exe (windowed, no console)
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name TubeGrab --icon assets/tubegrab.ico --add-data "assets/tubegrab.ico;assets" tubegrab.py
 
       - name: Make the portable zip (exe + FFmpeg + Deno, nothing to install)
         shell: pwsh

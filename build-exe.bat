@@ -11,7 +11,8 @@ echo Installing / updating build tools...
 %PY% -m pip install -U pyinstaller "yt-dlp[default]" || goto :fail
 
 echo Building TubeGrab.exe ...
-%PY% -m PyInstaller --noconfirm --clean --onefile --name TubeGrab --add-data "ui.html;." tubegrab.py || goto :fail
+%PY% -m PyInstaller --noconfirm --clean --onefile --windowed --name TubeGrab ^
+  --icon assets\tubegrab.ico --add-data "assets\tubegrab.ico;assets" tubegrab.py || goto :fail
 
 rem Make a ready-to-share folder
 if not exist "share" mkdir "share"
