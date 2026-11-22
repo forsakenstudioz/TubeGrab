@@ -6,6 +6,7 @@ Run it with:   python tubegrab.py
 """
 from __future__ import annotations
 
+import collections
 import os
 import queue
 import sys
@@ -41,6 +42,7 @@ QUALITIES = [("best", "Best"), ("2160", "4K (2160p)"), ("1440", "1440p"), ("1080
 CONTAINERS = [("mp4", "MP4"), ("mkv", "MKV")]
 AUDIO_FORMATS = [("mp3", "MP3"), ("m4a", "M4A (AAC)"), ("opus", "Opus"), ("flac", "FLAC"), ("wav", "WAV")]
 BITRATES = [("0", "Best"), ("320", "320 kbps"), ("256", "256 kbps"), ("192", "192 kbps"), ("128", "128 kbps")]
+PACINGS = [("off", "Off"), ("normal", "Normal (4-10 s)"), ("safe", "Safe (10-20 s)")]
 COOKIE_BROWSERS = [("", "Off"), ("firefox", "Firefox"), ("chrome", "Chrome"), ("edge", "Edge"),
                    ("brave", "Brave"), ("opera", "Opera"), ("vivaldi", "Vivaldi"), ("safari", "Safari")]
 
@@ -167,10 +169,16 @@ class App(tk.Tk):
         self.folder_nodes: dict = {} # CSV folder name -> its heading row in the list
         self._folder_iids: set = set()
         self._summary_due = False
-        self.analyse_q: queue.Queue = queue.Queue()   # links waiting to be read, handled by 3 workers
-        for _ in range(3):
-            threading.Thread(target=self._analyse_loop, daemon=True).start()
-        self.auto_start = False
+        # Playlists/channels must be read before you can pick from them. One reader with a short gap between
+        # links keeps YouTube happy; single videos don't need reading at all.
+        self.analyse_q: queue.Queue = queue.Queue()
+        threading.Thread(target=self._analyse_loop, daemon=True).start()
+        self.dl_q: collections.deque = collections.deque()   # plan numbers waiting to download (the live queue)
+        self.dl_lock = threading.Lock()
+        self.worker_running = False
+        self.in_queue: set = set()                  # rows queued / downloading / finished this session
+        self.skip_wait = threading.Event()          # "Retry now" during a YouTube cool-down
+        self.cooldown_until = 0.0
 
         # download state
         self.downloading = False
@@ -595,6 +603,7 @@ class App(tk.Tk):
         rate = tk.StringVar(value=c["rate_limit"])
         frags = tk.StringVar(value=str(c["concurrent_fragments"]))
         cookies = self._choice_var(COOKIE_BROWSERS, c["cookies_browser"])
+        pacing = self._choice_var(PACINGS, c["pacing"])
 
         row = 0
 
@@ -633,6 +642,9 @@ class App(tk.Tk):
         head("Network")
         field("Speed limit:", ttk.Entry(frm, textvariable=rate, width=10), "e.g.  2M  or  500K  (empty = unlimited)")
         field("Parallel fragments:", ttk.Spinbox(frm, from_=1, to=16, textvariable=frags, width=6))
+        field("Pause between videos:", ttk.Combobox(frm, textvariable=pacing, values=[l for _, l in PACINGS],
+                                                    width=16, state="readonly"),
+              "Stops YouTube from blocking you on big lists. 'Safe' is best for hundreds of videos.")
         field("Use cookies from:", ttk.Combobox(frm, textvariable=cookies, values=[l for _, l in COOKIE_BROWSERS],
                                                 width=10, state="readonly"),
               "For age-restricted / members-only / \"confirm you're not a bot\". Firefox is most reliable.")
@@ -651,7 +663,7 @@ class App(tk.Tk):
         def ok():
             new = {k: var.get() for k, var in v.items()}
             new.update(sub_langs=langs.get(), rate_limit=rate.get(), concurrent_fragments=frags.get() or 4,
-                       cookies_browser=self._choice(cookies))
+                       cookies_browser=self._choice(cookies), pacing=self._choice(pacing))
             self.cfg = core.clean_settings(new, self.cfg)
             core.save_settings(self.cfg)
             win.destroy()
@@ -713,31 +725,56 @@ class App(tk.Tk):
             self._load_links()
 
     def _load_links(self, auto: bool = False) -> int:
-        rows = [(r["url"], r["folder"], r["number"]) for r in core.parse_link_rows(self.links_txt.get("1.0", "end"))]
+        rows = core.parse_link_rows(self.links_txt.get("1.0", "end"))
         if not rows:
             if not auto:
                 messagebox.showinfo(APP_NAME, "Paste one or more YouTube links in the box first.")
             return 0
         known = {(L["url"], L["folder"]) for L in self.links.values()}
-        added = 0
-        for url, folder, number in rows:
+        added = ready = 0
+        new_singles = []
+        for r in rows:
+            url, folder = r["url"], r["folder"]
             if (url, folder) in known:
                 continue
-            iid = self.tree.insert(self._folder_node(folder) if folder else "", "end", text="  Reading link…",
-                                   values=("", folder or "", "", "Loading…"),
-                                   tags=("link", "muted"), image=self.imgs["none"])
-            self.links[iid] = {"url": url, "info": None, "mode": self.mode_var.get(), "touched": False,
-                               "state": "loading", "folder": folder, "number": number}
-            self.analyse_q.put((iid, url))
+            known.add((url, folder))
+            L = {"url": url, "info": None, "mode": self.mode_var.get(), "touched": False,
+                 "state": "loading", "folder": folder, "number": r["number"]}
+            parent = self._folder_node(folder) if folder else ""
+            vid = core.single_video_id(url)
+            if vid:
+                # One video: nothing to choose, so it's ready now. No look-up (that's what made YouTube block
+                # big lists) - its YouTube title appears when it downloads.
+                L.update(state="ready", info={"kind": "video", "url": url, "id": vid, "title": r["title"] or vid,
+                                              "duration": None, "count": 1, "provisional": True})
+                iid = self.tree.insert(parent, "end", text="", values=("", folder or "", "", ""),
+                                       tags=("link",), image=self.imgs["on"])
+                self.links[iid] = L
+                self.checked.add(iid)
+                new_singles.append(iid)
+                ready += 1
+            else:
+                iid = self.tree.insert(parent, "end", text="  Reading link…", values=("", folder or "", "", "Loading…"),
+                                       tags=("link", "muted"), image=self.imgs["on"])
+                self.links[iid] = L
+                self.checked.add(iid)          # ticked while being read; un-tick it to skip it
+                self.analyse_q.put((iid, url))
             added += 1
+        for iid in new_singles:                   # numbers are padded per folder, so label them all at the end
+            L = self.links[iid]
+            self.tree.item(iid, text=f"  {self._num_label(L)}{L['info']['title']}")
+            self._refresh_formats(iid)
         self.links_txt.delete("1.0", "end")
         for node in self.folder_nodes.values():
             self._refresh_folder(node)
         if added:
-            folders = sorted({f for _, f, _n in rows if f}, key=self._folder_key)
-            extra = f" for folder{'s' if len(folders) > 1 else ''} {', '.join(folders)}" if folders else ""
-            self._log(f"Reading {added} link{'s' if added > 1 else ''}{extra}…", "muted")
-            self.auto_start = self.auto_start or auto
+            folders = sorted({r["folder"] for r in rows if r["folder"]}, key=self._folder_key)
+            extra = f" in folder{'s' if len(folders) > 1 else ''} {', '.join(folders)}" if folders else ""
+            msg = f"Added {added} link{'s' if added > 1 else ''}{extra}."
+            if ready:
+                msg += f" {ready} ready to download now"
+                msg += f", {added - ready} being read." if added > ready else "."
+            self._log(msg, "muted")
         elif not auto:
             self._log("Those links are already in the list.", "muted")
         self._refresh_summary()
@@ -748,15 +785,20 @@ class App(tk.Tk):
             iid, url = self.analyse_q.get()
             if iid not in self.links:          # removed from the list while waiting
                 continue
+            while time.time() < self.cooldown_until and not self.skip_wait.is_set():
+                time.sleep(1)                  # YouTube asked us to slow down: don't read either
             try:
                 self.q.put(("analysed", iid, core.analyze(url, dict(self.cfg)), None))
             except Exception as e:  # noqa: BLE001
                 self.q.put(("analysed", iid, None, core.clean_error(e)))
+            time.sleep(1.0)                    # be gentle with YouTube
 
     def _show_link(self, iid, info, error):
         if iid not in self.links:
             return
         L = self.links[iid]
+        wanted = iid in self.checked
+        self.checked.discard(iid)
         if error:
             L["state"] = "error"
             self.tree.item(iid, text=f"  {L['url']}", values=("", L["folder"] or "", "", "✗ Couldn't read"),
@@ -775,7 +817,7 @@ class App(tk.Tk):
                     cid = self.tree.insert(iid, "end", text=f"  {e['index']:>3}.  {e['title']}",
                                            values=("", "", core.fmt_duration(e.get("duration")), ""))
                     self.child_of[cid] = (iid, e)
-                    if not single or e.get("id") == single:
+                    if wanted and (not single or e.get("id") == single):
                         self.checked.add(cid)
                     if single and e.get("id") == single:
                         self.after_idle(lambda c=cid: self.tree.see(c))
@@ -786,15 +828,14 @@ class App(tk.Tk):
             else:
                 self.tree.item(iid, text=f"  {self._num_label(L)}{info['title']}", tags=("link",),
                                values=("", L["folder"] or "", core.fmt_duration(info.get("duration")), ""))
-                self.checked.add(iid)
+                if wanted:
+                    self.checked.add(iid)
                 self._log(f"✓ Loaded '{info['title']}'.", "ok")
         self._refresh_check(iid)
         self._refresh_formats(iid)
         self._refresh_summary()
-        if self.auto_start and not any(L["state"] == "loading" for L in self.links.values()):
-            self.auto_start = False
-            if self._leaf_count(checked_only=True):
-                self._start_download()
+        if L.pop("auto_queue", False) and L["state"] == "ready" and wanted:
+            self._enqueue(self._make_plans(only=[iid], exclude=self.in_queue))   # Download was pressed earlier
 
     # =========================================================================== folders
     @staticmethod
@@ -875,6 +916,8 @@ class App(tk.Tk):
         L = self.links.get(iid)
         if L is None:
             return [iid]
+        if L["state"] == "loading":
+            return [iid]                       # stands for "whatever this link turns out to hold"
         if L["state"] != "ready":
             return []
         return list(self.tree.get_children(iid)) if L["info"]["kind"] == "playlist" else [iid]
@@ -892,16 +935,20 @@ class App(tk.Tk):
         n = sum(1 for x in leaves if x in self.checked)
         state = "on" if n == len(leaves) else "off" if n == 0 else "partial"
         self.tree.item(link_iid, image=self.imgs[state])
-        if self.links[link_iid]["info"]["kind"] == "playlist":
+        info = self.links[link_iid]["info"]
+        if info and info["kind"] == "playlist" and self.links[link_iid]["state"] == "ready":
             for c in leaves:
                 self.tree.item(c, image=self.imgs["on" if c in self.checked else "off"])
         parent = self.tree.parent(link_iid)
         if parent and self._is_folder(parent) and not getattr(self, "_bulk", False):
             self._refresh_folder(parent)
 
+    def _is_queued(self, iid) -> bool:
+        return any(x in self.in_queue for x in (self._leaves(iid) or [iid]))
+
     def _toggle(self, iid):
         if self._is_folder(iid):
-            targets = self._leaves(iid)
+            targets = [t for t in self._leaves(iid) if t not in self.in_queue]
             if not targets:
                 return
             turn_on = not all(t in self.checked for t in targets)
@@ -915,9 +962,11 @@ class App(tk.Tk):
             self._refresh_summary()
             return
         link = self.child_of[iid][0] if iid in self.child_of else iid
-        if link not in self.links or self.links[link]["state"] != "ready":
+        if link not in self.links or self.links[link]["state"] not in ("ready", "loading"):
             return
-        targets = self._leaves(iid)
+        targets = [t for t in self._leaves(iid) if t not in self.in_queue]   # queued ones stay as they are
+        if not targets:
+            return
         turn_on = not all(t in self.checked for t in targets)
         for t in targets:
             (self.checked.add if turn_on else self.checked.discard)(t)
@@ -925,8 +974,6 @@ class App(tk.Tk):
         self._refresh_summary()
 
     def _on_tree_click(self, ev):
-        if self.downloading:
-            return "break" if self.tree.identify_region(ev.x, ev.y) != "heading" else None
         iid = self.tree.identify_row(ev.y)
         if not iid:
             return None
@@ -934,10 +981,12 @@ class App(tk.Tk):
         if "indicator" in str(self.tree.identify_element(ev.x, ev.y)):
             return None                    # let the expand/collapse arrow work
         if col == "#1" and iid in self.links:
-            self._set_link_mode(iid, None)
+            if not self._is_queued(iid):
+                self._set_link_mode(iid, None)
             return "break"
         if col == "#2" and iid in self.links:
-            self._ask_folder(iid)
+            if not self._is_queued(iid):
+                self._ask_folder(iid)
             return "break"
         if col == "#0":
             self.tree.selection_set(iid)
@@ -946,16 +995,16 @@ class App(tk.Tk):
         return None
 
     def _on_tree_space(self, _ev):
-        if not self.downloading and (iid := self.tree.focus()):
+        if iid := self.tree.focus():
             self._toggle(iid)
         return "break"
 
     def _check_all(self, on: bool):
-        if self.downloading:
-            return
         self._bulk = True
         for lid in self.links:
             for leaf in self._leaves(lid):
+                if leaf in self.in_queue:
+                    continue
                 (self.checked.add if on else self.checked.discard)(leaf)
             self._refresh_check(lid)
         self._bulk = False
@@ -968,7 +1017,7 @@ class App(tk.Tk):
             self.tree.item(iid, open=open_)
 
     def _remove_link(self, iid):
-        if self.downloading or iid not in self.links:
+        if iid not in self.links or (self.downloading and self._is_queued(iid)):
             return
         for c in self.tree.get_children(iid):
             self.child_of.pop(c, None)
@@ -990,8 +1039,6 @@ class App(tk.Tk):
                 self.tree.delete(node)
 
     def _remove_folder(self, node):
-        if self.downloading:
-            return
         for k in list(self.tree.get_children(node)):
             self._remove_link(k)
 
@@ -1052,8 +1099,17 @@ class App(tk.Tk):
         if loading:
             txt += f"  ·  reading {loading}…"
         self.summary_lbl.config(text=txt)
-        if not self.downloading:
-            self.btn_go.config(text=f"Download checked ({chk})" if chk else "Download checked")
+        if self.downloading:
+            new = sum(1 for lid in self.links for leaf in self._leaves(lid)
+                      if leaf in self.checked and leaf not in self.in_queue)
+            self.btn_go.config(text=f"Add to queue ({new})" if new else "Add to queue",
+                               state="normal" if new else "disabled")
+            waiting = len(self.in_queue - self.done_rows)
+            if waiting:
+                txt += f"  ·  {waiting} queued"
+                self.summary_lbl.config(text=txt)
+        else:
+            self.btn_go.config(text=f"Download checked ({chk})" if chk else "Download checked", state="normal")
 
     def _on_tree_menu(self, ev):
         iid = self.tree.identify_row(ev.y)
@@ -1076,6 +1132,10 @@ class App(tk.Tk):
             return
         link = self.child_of[iid][0] if iid in self.child_of else iid
         L = self.links.get(link)
+        if any(p["link"] == link and not p.get("started") and not p.get("skip") for p in self.plans):
+            m.add_command(label="Remove from queue", command=lambda: self._unqueue(link))
+            m.add_separator()
+        state = "disabled" if self._is_queued(link) else "normal"
         if L and L["state"] == "ready":
             m.add_command(label="Check / uncheck", command=lambda: self._toggle(iid), state=state)
             m.add_separator()
@@ -1096,8 +1156,24 @@ class App(tk.Tk):
         m.add_command(label="Remove from list", command=lambda: self._remove_link(link), state=state)
         m.tk_popup(ev.x_root, ev.y_root)
 
+    def _unqueue(self, link):
+        """Take a link that hasn't started yet out of the download queue."""
+        for p in self.plans:
+            if p["link"] == link and not p.get("started") and not p.get("skip"):
+                p["skip"] = True
+                for r in p["rows"]:
+                    self.in_queue.discard(r)
+                    self.checked.discard(r)
+                    self.tree.set(r, "status", "")
+                if p["rows"][0] != link:
+                    self.tree.set(link, "status", "")
+                self.total_items -= len(p["rows"])
+        self._refresh_check(link)
+        self._update_overall()
+        self._refresh_summary()
+
     def _ask_folder(self, link):
-        if self.downloading or link not in self.links:
+        if link not in self.links or self._is_queued(link):
             return
         L = self.links[link]
         name = simpledialog.askstring(
@@ -1146,7 +1222,8 @@ class App(tk.Tk):
             info, base = L["info"], dict(mode=L["mode"], subfolder=L["folder"], prefix=self._prefix(L))
             if info["kind"] == "video":
                 if lid in self.checked:
-                    jobs.append(base | dict(title=info["title"], video_id=info.get("id")))
+                    title = "(YouTube title)" if info.get("provisional") else info["title"]
+                    jobs.append(base | dict(title=title, video_id=info.get("id")))
                 continue
             kids = [c for c in self.tree.get_children(lid) if c in self.checked]
             entries = [self.child_of[c][1] for c in kids]
@@ -1281,38 +1358,39 @@ class App(tk.Tk):
 
     # =========================================================================== downloading
     def _download_clicked(self):
-        if self.downloading:
-            return
+        """Download checked (or, while downloading, Add to queue). Never waits for links still being read:
+        those join the queue by themselves as soon as they're ready."""
         if core.extract_urls(self.links_txt.get("1.0", "end")):
-            self._load_links(auto=True)           # starts by itself once the links are read
-            self.overall_lbl.config(text="Reading links… the download starts by itself.")
-            return
-        if any(L["state"] == "loading" for L in self.links.values()):
-            self.auto_start = True
-            self.overall_lbl.config(text="Still reading links… the download starts by itself.")
-            return
+            self._load_links(auto=True)
+        loading = [lid for lid, L in self.links.items() if L["state"] == "loading" and lid in self.checked]
+        for lid in loading:
+            self.links[lid]["auto_queue"] = True
         if not self.links:
             messagebox.showinfo(APP_NAME, "Paste one or more YouTube links in box 1 first.")
             return
-        if not self._leaf_count(checked_only=True):
+        plans = self._make_plans(exclude=self.in_queue if self.downloading else frozenset())
+        if plans:
+            self._enqueue(plans)
+        elif loading:
+            self.overall_lbl.config(text=f"Reading {len(loading)} link{'s' if len(loading) > 1 else ''}… "
+                                         "they start downloading by themselves.")
+        elif not self.downloading:
             messagebox.showinfo(APP_NAME, "Nothing is checked. Tick what you want in the list.")
-            return
-        self._start_download()
 
-    def _make_plans(self) -> list:
+    def _make_plans(self, only=None, exclude=frozenset()) -> list:
         plans = []
-        for lid in self._links_in_order():
+        for lid in (only or self._links_in_order()):
             L = self.links[lid]
             if L["state"] != "ready":
                 continue
             info, mode = L["info"], L["mode"]
             if info["kind"] == "video":
-                if lid in self.checked:
+                if lid in self.checked and lid not in exclude:
                     plans.append({"link": lid, "task": core.Task(L["url"], mode, title=info["title"],
                                                                subfolder=L["folder"], prefix=self._prefix(L)),
                                   "rows": [lid], "by_index": {}, "by_id": {info.get("id"): lid}, "single": lid})
                 continue
-            kids = [c for c in self.tree.get_children(lid) if c in self.checked]
+            kids = [c for c in self.tree.get_children(lid) if c in self.checked and c not in exclude]
             if not kids:
                 continue
             entries = [self.child_of[c][1] for c in kids]
@@ -1331,46 +1409,93 @@ class App(tk.Tk):
         return plans
 
     def _start_download(self):
-        self._save_cfg()
-        plans = self._make_plans()
+        self._enqueue(self._make_plans())
+
+    def _enqueue(self, plans):
+        """Add downloads to the live queue, starting it if nothing is downloading yet."""
         if not plans:
             return
-        if not core.find_ffmpeg_dir():
-            messagebox.showwarning(APP_NAME, "FFmpeg was not found.\n\nIt is needed to merge video and audio "
-                                   "and to make MP3s. Run Install-Tools.bat (or put ffmpeg.exe and ffprobe.exe "
-                                   "next to TubeGrab), then restart TubeGrab.")
-            return
-        self.plans = plans
-        self.total_items = sum(len(p["rows"]) for p in plans)
-        self.done_rows = set()
-        self.counts = {"ok": 0, "skip": 0, "fail": 0, "stop": 0}
-        self.cur_row, self.cur_frac = None, 0.0
-        for p in plans:
-            for r in p["rows"]:
-                self.tree.set(r, "status", "Queued")
-                self.tree.item(r, tags=self._row_tags(r))
-            if p["rows"][0] != p["link"]:
-                self.tree.set(p["link"], "status", "Queued")
-        for node in self.folder_nodes.values():
-            self.tree.set(node, "status", "")
-            self.tree.item(node, tags=("folder",))
-        self.cancel.clear()
-        self.pause.clear()
-        self._set_busy(True)
-        n = self.total_items
-        self._log(f"▶ Starting {n} download{'s' if n > 1 else ''} → {self.cfg['download_dir']}", "ok")
+        self._save_cfg()
+        starting = not self.downloading
+        if starting:
+            if not core.find_ffmpeg_dir():
+                messagebox.showwarning(APP_NAME, "FFmpeg was not found.\n\nIt is needed to merge video and audio "
+                                       "and to make MP3s. Run Install-Tools.bat (or put ffmpeg.exe and ffprobe.exe "
+                                       "next to TubeGrab), then restart TubeGrab.")
+                return
+            self.plans = []
+            self.in_queue = set()
+            self.total_items = 0
+            self.done_rows = set()
+            self.counts = {"ok": 0, "skip": 0, "fail": 0, "stop": 0}
+            self.cur_row, self.cur_frac = None, 0.0
+            for node in self.folder_nodes.values():
+                self.tree.set(node, "status", "")
+                self.tree.item(node, tags=("folder",))
+            self.cancel.clear()
+            self.pause.clear()
+            self._set_busy(True)
         settings = dict(self.cfg)
-        threading.Thread(target=self._download_worker, args=(plans, settings), daemon=True).start()
+        n = 0
+        with self.dl_lock:
+            for p in plans:
+                p["settings"] = settings
+                for r in p["rows"]:
+                    self.tree.set(r, "status", "Queued")
+                    self.tree.item(r, tags=self._row_tags(r))
+                    self.in_queue.add(r)
+                if p["rows"][0] != p["link"]:
+                    self.tree.set(p["link"], "status", "Queued")
+                n += len(p["rows"])
+                self.plans.append(p)
+                self.dl_q.append(len(self.plans) - 1)
+            self.total_items += n
+            if not self.worker_running:
+                self.worker_running = True
+                threading.Thread(target=self._download_worker, daemon=True).start()
+        if starting:
+            self._log(f"▶ Starting {n} download{'s' if n > 1 else ''} → {self.cfg['download_dir']}", "ok")
+        else:
+            self._log(f"+ Added {n} to the queue.", "ok")
+        self._update_overall()
+        self._refresh_summary()
 
-    def _download_worker(self, plans, settings):
-        for i, p in enumerate(plans):
-            if self.cancel.is_set():
-                break
+    COOLDOWNS = (10, 20, 30, 60)        # minutes to wait after YouTube says "slow down" (longer if it repeats)
+
+    def _download_worker(self):
+        strikes = 0
+        while True:
+            with self.dl_lock:
+                if not self.dl_q:
+                    self.worker_running = False
+                    self.q.put(("all_done",))
+                    return
+                i = self.dl_q.popleft()
+            p = self.plans[i]
+            if self.cancel.is_set() or p.get("skip"):
+                self.q.put(("plan_skipped", i))
+                continue
+            p["started"] = True
             self.q.put(("plan", i))
-            result = core.download(p["task"], settings, lambda k, d, i=i: self.q.put(("dl", i, k, d)),
+            result = core.download(p["task"], p["settings"], lambda k, d, i=i: self.q.put(("dl", i, k, d)),
                                    self.cancel, self.pause)
             self.q.put(("plan_done", i, result))
-        self.q.put(("all_done",))
+            if result.status != "rate_limited":
+                if result.files:
+                    strikes = 0
+                continue
+            # YouTube asked us to slow down: put this one back at the front, wait, then carry on.
+            minutes = self.COOLDOWNS[min(strikes, len(self.COOLDOWNS) - 1)]
+            strikes += 1
+            with self.dl_lock:
+                self.dl_q.appendleft(i)
+            self.skip_wait.clear()
+            self.cooldown_until = time.time() + minutes * 60
+            self.q.put(("cooldown", minutes, result.rate_limited))
+            while time.time() < self.cooldown_until and not self.cancel.is_set() and not self.skip_wait.is_set():
+                time.sleep(0.5)
+            self.cooldown_until = 0.0
+            self.q.put(("cooldown_end",))
 
     def _row_for(self, plan, data):
         if plan["single"]:
@@ -1391,6 +1516,7 @@ class App(tk.Tk):
         if row == self.cur_row:
             self.cur_frac = 0.0
         self._update_overall()
+        self._refresh_summary()
 
     def _on_dl_event(self, i, kind, d):
         plan = self.plans[i]
@@ -1402,6 +1528,11 @@ class App(tk.Tk):
                 self.tree.see(row)
             self._current_title = d.get("title") or ""
             self.file_lbl.config(text=self._current_title)
+            L = self.links.get(row)
+            if L and L["info"].get("provisional") and d.get("title"):
+                L["info"]["title"] = d["title"]
+                L["info"]["provisional"] = False
+                self.tree.item(row, text=f"  {self._num_label(L)}{d['title']}")
             self.file_bar["value"] = 0
         elif kind == "progress":
             row = self._row_for(plan, d)
@@ -1450,6 +1581,15 @@ class App(tk.Tk):
 
     def _on_plan_done(self, i, result):
         plan = self.plans[i]
+        if result.status == "rate_limited":         # not a failure: it goes back in the queue
+            plan["started"] = False
+            left = [r for r in plan["rows"] if r not in self.done_rows]
+            for r in left:
+                self.tree.set(r, "status", "Waiting (YouTube limit)")
+            if plan["by_index"] and len(left) < len(plan["rows"]):      # playlist: retry only what's missing
+                inv = {row: idx for idx, row in plan["by_index"].items()}
+                plan["task"].items = core.compress_ranges(inv[r] for r in left if r in inv)
+            return
         self.after_idle(lambda p=plan["link"]: self._folder_status(self.tree.parent(p))
                         if self.tree.exists(p) and self._is_folder(self.tree.parent(p)) else None)
         leftover = "Stopped" if result.status == "cancelled" else "Not downloaded"
@@ -1468,7 +1608,31 @@ class App(tk.Tk):
             self.tree.set(plan["link"], "status", txt)
             self.tree.item(plan["link"], tags=("link", "failed" if bad else "done"))
 
+    def _on_plan_skipped(self, i):
+        plan = self.plans[i]
+        if not plan.get("skip"):                 # skipped because Stop was pressed
+            for r in plan["rows"]:
+                self._finish_row(r, "Stopped", "stop")
+            if plan["rows"][0] != plan["link"]:
+                self.tree.set(plan["link"], "status", "Stopped")
+
+    def _on_cooldown(self, minutes, message):
+        self._log(f"⏸ YouTube asked TubeGrab to slow down: {message[:160]}", "warn")
+        self._log(f"    Waiting {minutes} min, then carrying on by itself - nothing is lost. "
+                  "Press 'Retry now' to try sooner.", "warn")
+        self.btn_pause.config(text="Retry now", state="normal")
+        self._tick_cooldown()
+
+    def _tick_cooldown(self):
+        if self.cooldown_until <= time.time() or not self.downloading:
+            return
+        self._update_overall()
+        self.after(1000, self._tick_cooldown)
+
     def _on_all_done(self):
+        with self.dl_lock:
+            if self.worker_running:              # more was added after the queue ran dry: keep going
+                return
         self._set_busy(False)
         c = self.counts
         parts = [f"{c['ok']} downloaded"]
@@ -1490,6 +1654,11 @@ class App(tk.Tk):
     def _update_overall(self):
         if not self.total_items:
             return
+        if self.cooldown_until > time.time():          # the countdown wins while waiting for YouTube
+            left = self.cooldown_until - time.time()
+            self.overall_lbl.config(text=f"YouTube limit - waiting {core.fmt_duration(left)} before continuing   ·   "
+                                         f"{self.counts['ok']} done so far")
+            return
         done = len(self.done_rows)
         cur = self.cur_frac if self.cur_row and self.cur_row not in self.done_rows else 0.0
         self.overall_bar["value"] = min(1000, (done + cur) / self.total_items * 1000)
@@ -1509,12 +1678,17 @@ class App(tk.Tk):
                     w.config(state="disabled" if busy else "normal")
             except tk.TclError:
                 pass
-        self.links_txt.config(state="disabled" if busy else "normal")
-        self.btn_go.config(state="disabled" if busy else "normal")
+        for w in (self.btn_load, self.btn_paste, self.btn_import):   # links can still be added while downloading
+            w.config(state="normal")
+        self.links_txt.config(state="normal")
+        self.btn_go.config(state="normal")
         self.btn_pause.config(state="normal" if busy else "disabled", text="Pause")
         self.btn_stop.config(state="normal" if busy else "disabled")
 
     def _toggle_pause(self):
+        if self.cooldown_until:                  # during a YouTube cool-down this button is "Retry now"
+            self.skip_wait.set()
+            return
         if self.pause.is_set():
             self.pause.clear()
             self.btn_pause.config(text="Pause")
@@ -1588,6 +1762,16 @@ class App(tk.Tk):
                     self._on_dl_event(*msg[1:])
                 elif kind == "plan_done":
                     self._on_plan_done(*msg[1:])
+                elif kind == "plan_skipped":
+                    self._on_plan_skipped(*msg[1:])
+                elif kind == "cooldown":
+                    self._on_cooldown(*msg[1:])
+                elif kind == "cooldown_end":
+                    self.btn_pause.config(text="Resume" if self.pause.is_set() else "Pause",
+                                          state="normal" if self.downloading else "disabled")
+                    if self.downloading:
+                        self._log("▶ Trying again…", "muted")
+                        self._update_overall()
                 elif kind == "all_done":
                     self._on_all_done()
                 elif kind == "update" and msg[1]:

@@ -68,8 +68,8 @@ def test_video_number_column_is_read():
             "3,2,Intro again,https://youtu.be/Os-FdeE6dhg,Repeat of video 1\n"
             "3,8,Part 2,https://youtu.be/waL-wFNi_mE,\n")
     assert core.parse_link_rows(text) == [
-        {"url": "https://youtu.be/Os-FdeE6dhg", "folder": "3", "number": 1},
-        {"url": "https://youtu.be/waL-wFNi_mE", "folder": "3", "number": 8}]
+        {"url": "https://youtu.be/Os-FdeE6dhg", "folder": "3", "number": 1, "title": "Intro"},
+        {"url": "https://youtu.be/waL-wFNi_mE", "folder": "3", "number": 8, "title": "Part 2"}]
     assert core.parse_link_rows("Note,link\nhello,https://youtu.be/a")[0]["number"] is None   # "Note" isn't "No"
     assert core.number_prefix(8, 15) == "08" and core.number_prefix(7, 125) == "007" and core.number_prefix(None, 9) is None
 
@@ -201,3 +201,43 @@ def test_end_to_end_videos_go_into_their_folders():
     assert (out / "2" / "Audio" / "b [b].mp3").is_file()
     opts = core.build_opts(core.Task("https://youtu.be/x", subfolder="1"), s)
     assert "playlist_title" not in opts["outtmpl"]["default"]          # playlist videos go straight into "1"
+
+
+def test_single_video_links_need_no_reading():
+    assert core.single_video_id("https://youtu.be/waL-wFNi_mE") == "waL-wFNi_mE"
+    assert core.single_video_id("https://www.youtube.com/watch?v=waL-wFNi_mE") == "waL-wFNi_mE"
+    assert core.single_video_id("https://www.youtube.com/shorts/waL-wFNi_mE") == "waL-wFNi_mE"
+    assert core.single_video_id("https://www.youtube.com/watch?v=waL-wFNi_mE&list=PL1") is None   # pick from list
+    assert core.single_video_id("https://www.youtube.com/playlist?list=PL1") is None
+    assert core.single_video_id("https://www.youtube.com/@channel") is None
+
+
+def test_youtube_rate_limit_is_not_a_failure():
+    msg = ("[youtube] h_oaSE35uUI: Video unavailable. This content isn't available, try again later. "
+           "Your account has been rate-limited by YouTube for up to an hour.")
+    assert core.is_rate_limited(msg) and core.is_rate_limited("HTTP Error 429: Too Many Requests")
+    assert not core.is_rate_limited("Private video") and not core.is_rate_limited("Video unavailable")
+    assert "waits" in core.hint_for(msg)
+    # A rate-limit error stops the task right away and is reported as "rate_limited", not as an error.
+    # (a local 404 stands in for YouTube's answer)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(SimpleHTTPRequestHandler, directory=str(TMP)))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    original = core.is_rate_limited
+    core.is_rate_limited = lambda text: "404" in (text or "") or original(text)
+    events = []
+    try:
+        r = core.download(core.Task(f"http://127.0.0.1:{server.server_address[1]}/missing.mp4"),
+                          dict(core.DEFAULTS, download_dir=str(TMP / "rl"), pacing="off"),
+                          lambda k, d: events.append(k))
+    finally:
+        core.is_rate_limited = original
+        server.shutdown()
+    assert r.status == "rate_limited" and r.rate_limited and not r.errors and "error" not in events
+
+
+def test_pacing_settings():
+    o = core.build_opts(core.Task("https://youtu.be/x"), dict(core.DEFAULTS))
+    assert (o["sleep_interval"], o["max_sleep_interval"]) == (4, 10)
+    o = core.build_opts(core.Task("https://youtu.be/x"), dict(core.DEFAULTS, pacing="safe"))
+    assert (o["sleep_interval"], o["max_sleep_interval"]) == (10, 20)
+    assert "sleep_interval" not in core.build_opts(core.Task("https://youtu.be/x"), dict(core.DEFAULTS, pacing="off"))

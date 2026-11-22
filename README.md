@@ -50,6 +50,16 @@ the video number (zero-padded so files sort in order), the YouTube title, and th
 and **Preview structure…** shows every folder and the exact file names that will be created, with totals. It can also save them as a text file.
 To move a link to another folder, click its **Folder** cell or right-click → **Set folder…**. See [`docs/example-links.csv`](docs/example-links.csv).
 
+### Big lists (hundreds of videos)
+
+- Single-video links are ready the moment they're imported, so press **Download checked** straight away.
+  While it runs you can tick more and press **Add to queue**, or right-click → **Remove from queue**.
+- YouTube limits how many requests one connection can make. TubeGrab pauses a few seconds between videos;
+  for very big lists choose **Settings → Pause between videos → Safe**.
+- If YouTube still says "rate-limited / try again later", TubeGrab doesn't fail the rest of the list: it waits
+  (10 minutes, longer if it happens again) and then carries on with the same video. **Retry now** skips the wait.
+- Stopped halfway? Import the same CSV again and press Download: finished videos are skipped.
+
 ## Settings
 
 **Settings…** (top right) has the rest:
@@ -62,6 +72,7 @@ To move a link to another folder, click its **Folder** cell or right-click → *
 | Playlists in their own folder, numbered files | `Playlist name/01 - Title.mp4` |
 | Skip things I already downloaded | Remembers finished items (separately for video and audio); *Forget download history* resets it |
 | Speed limit | e.g. `2M` so downloads don't hog the connection |
+| Pause between videos | Normal (4-10 s) or Safe (10-20 s) so YouTube doesn't block big lists |
 | Use cookies from | For age-restricted / members-only / "confirm you're not a bot" errors (Firefox works best) |
 | Update yt-dlp | When running from source; YouTube changes often |
 

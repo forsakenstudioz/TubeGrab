@@ -14,6 +14,12 @@
   select the whole folder), and **Preview structure…** shows every folder and exact file name, with totals
   and a "Save as text" option
 - Folder headings show progress while downloading ("12 of 35 done")
+- **No waiting before downloading:** single-video links are ready the moment you import them (no look-up first),
+  so downloads start straight away. Playlists/channels are read in the background and join the queue by themselves.
+- **Live queue:** while downloading, tick more and press **Add to queue**; right-click → **Remove from queue**
+- **YouTube "rate-limited" protection:** a short pause between videos (Settings → Pause between videos), and when
+  YouTube still says "slow down", TubeGrab waits (10 min, longer if it repeats), then retries the same video by
+  itself - those videos are no longer marked as failed. **Retry now** skips the wait.
 - Big lists load much faster (1,500+ links in under a second)
 - CSV separator is detected once per file, so a `;` inside a title can't break a row
 - Example file: `docs/example-links.csv`

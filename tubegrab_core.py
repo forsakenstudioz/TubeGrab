@@ -55,6 +55,7 @@ DEFAULTS = {
     "playlist_folder": True,
     "number_playlist_items": True,
     "concurrent_fragments": 4,
+    "pacing": "normal",            # off | normal | safe - pause between videos so YouTube doesn't block you
     "rate_limit": "",              # e.g. "2M" - empty means unlimited
     "cookies_browser": "",         # "" | firefox | chrome | edge | brave | opera | vivaldi | safari
 }
@@ -66,6 +67,7 @@ CHOICES = {
     "audio_format": {"mp3", "m4a", "opus", "flac", "wav"},
     "audio_quality": {"0", "320", "256", "192", "128"},
     "cookies_browser": {"", "firefox", "chrome", "edge", "brave", "opera", "vivaldi", "safari"},
+    "pacing": {"off", "normal", "safe"},
 }
 LIMITS = {"concurrent_fragments": (1, 16)}
 
@@ -223,7 +225,7 @@ def parse_link_rows(text: str) -> list[dict]:
     """
     out: list[dict] = []
     seen: set = set()
-    folder_col = number_col = None
+    folder_col = number_col = title_col = None
     lines = [ln for ln in (text or "").lstrip("\ufeff").splitlines() if ln.strip()]
     delim = _file_delimiter(lines[0]) if lines else None
     for line in lines:
@@ -235,6 +237,8 @@ def parse_link_rows(text: str) -> list[dict]:
                     folder_col = i
                 elif number_col is None and _NUMBER_HEADER.search(c):
                     number_col = i
+                elif title_col is None and re.search(r"title|name", c, re.I):
+                    title_col = i
             continue
         folder = None
         number = None
@@ -251,7 +255,10 @@ def parse_link_rows(text: str) -> list[dict]:
             for u in extract_urls(cells[i]):
                 if (u, folder) not in seen:
                     seen.add((u, folder))
-                    out.append({"url": u, "folder": folder, "number": number if len(url_cells) == 1 else None})
+                    title = cells[title_col].strip() if title_col is not None and title_col < len(cells) \
+                        and title_col not in url_cells and len(url_cells) == 1 else None
+                    out.append({"url": u, "folder": folder, "number": number if len(url_cells) == 1 else None,
+                                "title": title or None})
     return out
 
 
@@ -271,6 +278,29 @@ def read_text_file(path) -> str:
         except UnicodeDecodeError:
             continue
     return raw.decode("utf-8", errors="replace")
+
+
+_YT_ID = r"([A-Za-z0-9_-]{11})"
+
+
+def single_video_id(url: str) -> str | None:
+    """The video ID if the link is clearly one YouTube video (not a playlist/channel), else None.
+    Such links can be downloaded straight away - there's nothing to choose from first."""
+    u = urlparse(url)
+    host = (u.hostname or "").lower().removeprefix("www.").removeprefix("m.").removeprefix("music.")
+    q = parse_qs(u.query)
+    if "list" in q:
+        return None
+    if host == "youtu.be":
+        m = re.fullmatch("/" + _YT_ID + "/?", u.path)
+    elif host in ("youtube.com", "youtube-nocookie.com"):
+        if u.path in ("/watch", "/watch/"):
+            v = (q.get("v") or [""])[0]
+            return v if re.fullmatch(_YT_ID, v) else None
+        m = re.fullmatch(r"/(?:shorts|live|embed|v)/" + _YT_ID + "/?", u.path)
+    else:
+        return None
+    return m.group(1) if m else None
 
 
 def video_id_in_url(url: str) -> str | None:
@@ -340,6 +370,9 @@ class _QuietLogger:
 
 # ----------------------------------------------------------------------------------- errors
 HINTS = [
+    ("rate-limit", "YouTube is limiting requests from your connection (it lasts up to an hour). TubeGrab waits and "
+                   "carries on by itself. For big lists, set Settings → Pause between videos → Safe."),
+    ("rate limit", "YouTube is limiting requests from your connection. TubeGrab waits and carries on by itself."),
     ("sign in to confirm", "YouTube wants a logged-in session (age limit or bot check). In Settings, set "
                            "'Use cookies from browser' - Firefox works most reliably."),
     ("javascript runtime", "Install Deno (run Install-Tools.bat) so yt-dlp can solve YouTube's challenges."),
@@ -353,6 +386,21 @@ HINTS = [
                        "or switch to Firefox."),
     ("unable to download webpage", "Couldn't reach the site - check the link and your internet connection."),
 ]
+
+
+_RATE_LIMIT = re.compile(r"rate.?limit|http error 429|too many requests|content isn't available, try again later", re.I)
+
+
+def is_rate_limited(text: str) -> bool:
+    """YouTube's 'slow down' answers: retrying later works, so these aren't real failures."""
+    return bool(_RATE_LIMIT.search(text or ""))
+
+
+PACING = {   # seconds: (before each video min, max, between page requests)
+    "off": None,
+    "normal": (4, 10, 1.0),
+    "safe": (10, 20, 1.5),
+}
 
 
 def hint_for(text: str) -> str:
@@ -400,6 +448,7 @@ class Result:
     files: list = field(default_factory=list)
     errors: list = field(default_factory=list)
     skipped: int = 0
+    rate_limited: str = ""               # YouTube's message when it asked us to slow down
 
 
 Emit = Callable[[str, dict], None]
@@ -430,6 +479,10 @@ class _Logger:
                 self.emit("warning", {"message": msg})
             return
         msg = clean_error(msg)[:600]
+        if is_rate_limited(msg):
+            # Every further request would fail the same way: stop now and let the caller wait and retry.
+            self.result.rate_limited = msg
+            raise DownloadCancelled()
         if msg and msg not in self.result.errors:
             self.result.errors.append(msg)
             m = _ERR_ID.match(msg)
@@ -478,6 +531,9 @@ def build_opts(task: Task, settings: dict) -> dict:
         opts["download_archive"] = str(archive_file(mode, task.subfolder))
     if s["rate_limit"] and (rl := parse_bytes(s["rate_limit"])):
         opts["ratelimit"] = rl
+    if pace := PACING.get(s.get("pacing", "normal")):
+        opts.update(sleep_interval=pace[0], max_sleep_interval=pace[1], sleep_interval_requests=pace[2],
+                    sleep_interval_subtitles=pace[2])
 
     pps = []
     if s["sponsorblock"]:
@@ -621,12 +677,16 @@ def download(task: Task, settings: dict, emit: Emit, cancel: threading.Event | N
         pass
     except Exception as e:  # noqa: BLE001 - surface anything to the UI
         msg = clean_error(e)[:600]
-        if msg not in result.errors:
+        if is_rate_limited(msg):
+            result.rate_limited = msg
+        elif msg not in result.errors:
             result.errors.append(msg)
             emit("error", {"message": msg, "id": state["id"], "hint": hint_for(msg)})
 
     if cancel.is_set():
         result.status = "cancelled"
+    elif result.rate_limited:
+        result.status = "rate_limited"
     elif result.errors:
         result.status = "partial" if (result.files or result.skipped) else "error"
     return result
