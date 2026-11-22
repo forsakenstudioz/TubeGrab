@@ -35,6 +35,35 @@ def test_links_are_found_in_any_text():
     assert core.video_id_in_url("https://www.youtube.com/watch?v=xyz&list=PL1") == "xyz"
 
 
+
+def test_csv_with_folder_column():
+    csv_text = ("\ufefflink,folder number\n"
+                "https://youtu.be/aaa,1\n"
+                "https://www.youtube.com/watch?v=bbb&list=PL1 , 2\n"
+                "\"https://youtu.be/ccc\",\n"            # old links.txt style: no folder
+                "https://youtu.be/aaa,1\n"                 # duplicate row
+                "https://youtu.be/aaa,2\n")                # same video, other folder
+    assert core.parse_links(csv_text) == [
+        ("https://youtu.be/aaa", "1"), ("https://www.youtube.com/watch?v=bbb&list=PL1", "2"),
+        ("https://youtu.be/ccc", None), ("https://youtu.be/aaa", "2")]
+
+
+def test_folder_column_found_by_header_and_other_separators():
+    assert core.parse_links("title;Folder;url\nMy song;7;https://youtu.be/x") == [("https://youtu.be/x", "7")]
+    assert core.parse_links("youtu.be/d\t3") == [("https://youtu.be/d", "3")]          # pasted from Excel
+    assert core.parse_links("see youtu.be/a and youtu.be/b") == [("https://youtu.be/a", None),
+                                                                 ("https://youtu.be/b", None)]
+
+
+def test_folder_names_are_made_safe():
+    assert core.clean_folder("1.0") == "1"
+    assert core.clean_folder(" .. ") is None
+    assert core.clean_folder("a/b") == "a_b"
+    assert core.clean_folder("..\\..\\Windows") == "_.._Windows"
+    assert core.clean_folder("CON") == "CON_"
+    assert core.clean_folder('"Songs"') == "Songs"
+
+
 def test_playlist_ranges():
     assert core.compress_ranges([9, 1, 2, 3, 5, 8]) == "1-3,5,8-9"
 
@@ -112,3 +141,32 @@ def test_end_to_end_playlist_selection_audio_and_history():
     finally:
         server.shutdown()
 
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg not installed")
+def test_end_to_end_videos_go_into_their_folders():
+    media = TMP / "media2"
+    media.mkdir()
+    for name in ("a", "b"):
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=10",
+                        "-f", "lavfi", "-i", "sine", "-t", "2", "-c:v", "libx264", "-c:a", "aac", "-shortest",
+                        str(media / f"{name}.mp4")], check=True)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(SimpleHTTPRequestHandler, directory=str(media)))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    out = TMP / "foldered"
+    s = dict(core.DEFAULTS, download_dir=str(out), embed_thumbnail=False)
+    rows = core.parse_links(f"link,folder\n{base}/a.mp4,1\n{base}/b.mp4,2\n{base}/a.mp4,2\n")
+    try:
+        for url, folder in rows:
+            r = core.download(core.Task(url, "video", subfolder=folder), s, lambda k, d: None)
+            assert r.status == "done" and r.files, r.errors
+        r = core.download(core.Task(f"{base}/b.mp4", "audio", subfolder="2"), s, lambda k, d: None)
+        assert r.status == "done", r.errors
+    finally:
+        server.shutdown()
+    assert (out / "1" / "a [a].mp4").is_file()
+    assert (out / "2" / "b [b].mp4").is_file()
+    assert (out / "2" / "a [a].mp4").is_file()          # same video in a second folder is not skipped
+    assert (out / "2" / "Audio" / "b [b].mp3").is_file()
+    opts = core.build_opts(core.Task("https://youtu.be/x", subfolder="1"), s)
+    assert "playlist_title" not in opts["outtmpl"]["default"]          # playlist videos go straight into "1"

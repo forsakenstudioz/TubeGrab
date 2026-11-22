@@ -3,6 +3,8 @@ TubeGrab core: everything that talks to yt-dlp. No UI code here, so it can be te
 """
 from __future__ import annotations
 
+import csv
+import hashlib
 import json
 import os
 import re
@@ -20,7 +22,7 @@ import yt_dlp
 from yt_dlp.utils import DownloadCancelled, parse_bytes
 
 APP_NAME = "TubeGrab"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 # "owner/repo" on GitHub, used to tell users when a new release is out.
 # The GitHub release workflow fills both of these in automatically for the .exe.
 GITHUB_REPO = ""
@@ -115,7 +117,14 @@ def audio_dir(settings: dict) -> Path:
 
 
 def history_files() -> list[Path]:
-    return [DATA_DIR / f"archive-{m}.txt" for m in ("video", "audio")]
+    return sorted(DATA_DIR.glob("archive-*.txt"))
+
+
+def archive_file(mode: str, folder: str | None = None) -> Path:
+    """Download history, kept per mode and per folder, so the same video can go into folder 1 and 2."""
+    if not folder:
+        return DATA_DIR / f"archive-{mode}.txt"
+    return DATA_DIR / f"archive-{mode}-{hashlib.sha1(folder.lower().encode()).hexdigest()[:12]}.txt"
 
 
 # ----------------------------------------------------------------------------------- tools
@@ -157,6 +166,79 @@ def extract_urls(text: str) -> list[str]:
         if u not in out:
             out.append(u)
     return out
+
+
+_BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+
+
+def clean_folder(name) -> str | None:
+    """Turn a CSV 'folder' value into a safe single folder name ('1', 'Songs'...), or None."""
+    if name is None:
+        return None
+    s = str(name).strip().strip("\"'").strip()
+    if re.fullmatch(r"\d+\.0+", s):          # Excel sometimes writes 1 as 1.0
+        s = s.split(".")[0]
+    s = _BAD_CHARS.sub("_", s).strip(" .")
+    if not s.strip("_"):
+        return None
+    if s.lower() in _RESERVED:
+        s += "_"
+    return s[:80]
+
+
+def _cells(line: str) -> list[str]:
+    for delim in ("\t", ";", ","):
+        if delim in line:
+            try:
+                return [c.strip() for c in next(csv.reader([line], delimiter=delim, skipinitialspace=True))]
+            except (csv.Error, StopIteration):
+                break
+    return [line.strip()]
+
+
+def parse_links(text: str) -> list[tuple[str, str | None]]:
+    """
+    Read links (+ optional folder) from pasted text, a .txt or a .csv file.
+    Each line may be just a link, or a row like  "link, folder"  (comma, semicolon or tab separated).
+    A header row with a column named like "folder" picks that column; otherwise the first non-link
+    value on the row is the folder. Returns [(url, folder or None)], without duplicates.
+    """
+    out: list[tuple[str, str | None]] = []
+    folder_col = None
+    for line in (text or "").lstrip("\ufeff").splitlines():
+        if not line.strip():
+            continue
+        cells = _cells(line)
+        url_cells = [i for i, c in enumerate(cells) if _URL.search(c)]
+        if not url_cells:                               # header row (or junk)
+            for i, c in enumerate(cells):
+                if "folder" in c.lower():
+                    folder_col = i
+            continue
+        folder = None
+        if len(url_cells) == 1:
+            if folder_col is not None and folder_col != url_cells[0] and folder_col < len(cells):
+                folder = clean_folder(cells[folder_col])
+            else:
+                folder = next((clean_folder(c) for i, c in enumerate(cells)
+                               if i != url_cells[0] and clean_folder(c)), None)
+        for i in url_cells:
+            for u in extract_urls(cells[i]):
+                if (u, folder) not in out:
+                    out.append((u, folder))
+    return out
+
+
+def read_text_file(path) -> str:
+    """Read a .txt/.csv saved by Notepad or Excel (UTF-8 with or without BOM, or Windows ANSI)."""
+    raw = Path(path).read_bytes()
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 def video_id_in_url(url: str) -> str | None:
@@ -276,6 +358,7 @@ class Task:
     items: str | None = None
     noplaylist: bool = False
     title: str = ""
+    subfolder: str | None = None    # save into download_dir/<subfolder> (from the CSV "folder" column)
 
 
 @dataclass
@@ -327,10 +410,16 @@ def build_opts(task: Task, settings: dict) -> dict:
     name = "%(title)s [%(id)s].%(ext)s"
     if s["number_playlist_items"]:
         name = "%(playlist_index&{} - |)s" + name
-    if s["playlist_folder"]:
+    if s["playlist_folder"] and not task.subfolder:   # a CSV folder already groups the videos
         name = "%(playlist_title|.)s/" + name
 
-    home = audio_dir(s) if mode == "audio" else Path(s["download_dir"])
+    base = Path(s["download_dir"])
+    if task.subfolder:
+        sub = clean_folder(task.subfolder)
+        if not sub:
+            raise ValueError("Invalid folder name.")
+        base = base / sub
+    home = base / "Audio" if mode == "audio" else base
     opts = base_opts(s) | {
         # half-finished files live in a hidden temp folder (per mode) instead of cluttering downloads
         "paths": {"home": str(home), "temp": str(Path(s["download_dir"]) / ".tubegrab-tmp" / mode)},
@@ -349,7 +438,7 @@ def build_opts(task: Task, settings: dict) -> dict:
         opts["playlist_items"] = task.items
     if s["skip_downloaded"]:
         # separate history per mode, so grabbing the MP3 of a video you already have still works
-        opts["download_archive"] = str(DATA_DIR / f"archive-{mode}.txt")
+        opts["download_archive"] = str(archive_file(mode, task.subfolder))
     if s["rate_limit"] and (rl := parse_bytes(s["rate_limit"])):
         opts["ratelimit"] = rl
 

@@ -27,6 +27,25 @@ In a hurry? Paste links and press **Download checked** straight away. They're re
 
 Videos are saved to `Downloads\TubeGrab`, audio to `Downloads\TubeGrab\Audio`.
 
+### Sorting videos into folders (CSV)
+
+Make a CSV (in Excel: *Save as → CSV*) with a link column and a folder column, and open it with **Import .txt / .csv…**:
+
+| Link | Folder |
+|---|---|
+| https://www.youtube.com/watch?v=… | 1 |
+| https://www.youtube.com/watch?v=… | 1 |
+| https://www.youtube.com/playlist?list=… | 2 |
+
+Everything marked `1` is saved in `Downloads\TubeGrab\1`, everything marked `2` in `Downloads\TubeGrab\2`, and so on.
+Folder names can be numbers or words. Links without a folder go to the main folder. A playlist with a folder goes straight into that folder.
+Audio downloads go in an `Audio` subfolder inside the folder.
+
+- The folder column is found by its header (any header containing "folder"). Without a header, the first non-link value on each row is used.
+- You can also type or paste `link, folder` lines into box 1, or copy the two columns straight from Excel.
+- To change a link's folder later, click its **Folder** cell or right-click it → **Set folder…**.
+- See [`docs/example-links.csv`](docs/example-links.csv).
+
 ## Settings
 
 **Settings…** (top right) has the rest:

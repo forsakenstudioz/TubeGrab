@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.0 - 2026-11-22
+
+- **Sort downloads into folders:** import a CSV with a link column and a folder column
+  (e.g. `1`, `2`, `Songs`). Each link's videos are saved in `Downloads\TubeGrab\<folder>`.
+- Also works by typing or pasting `link, folder` per line (copying two columns from Excel works too)
+- New **Folder** column in the list; click it or right-click a link to set or clear its folder
+- Playlists with a folder go straight into that folder (no extra playlist subfolder)
+- Download history is kept per folder, so the same video can be saved in two folders
+- Example file: `docs/example-links.csv`
+
 ## 1.1.0 - 2026-10-23
 
 TubeGrab is now a real desktop app instead of a page in your browser.

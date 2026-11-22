@@ -15,7 +15,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 # A windowed .exe has no console; give libraries somewhere harmless to print.
 if sys.stdout is None:
@@ -230,7 +230,7 @@ class App(tk.Tk):
         bx.grid(row=0, column=1, sticky="n")
         self.btn_load = ttk.Button(bx, text="Load links", style="Accent.TButton", command=self._load_links)
         self.btn_paste = ttk.Button(bx, text="Paste", command=self._paste)
-        self.btn_import = ttk.Button(bx, text="Import .txt…", command=self._import_txt)
+        self.btn_import = ttk.Button(bx, text="Import .txt / .csv…", command=self._import_txt)
         for b in (self.btn_load, self.btn_paste, self.btn_import):
             if self.compact:
                 b.pack(side="left", padx=(0, 6))
@@ -238,7 +238,7 @@ class App(tk.Tk):
                 b.pack(side="top", fill="x", padx=6, pady=3)
         if not self.compact:
             ttk.Label(lnk, text="Videos, playlists, channels or Shorts - one per line. "
-                                "Ctrl+Enter loads them; 'Download checked' also works straight away.",
+                                "To sort into folders, write  link, 1  or import a CSV.",
                       style="Muted.TLabel").grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
         lnk.columnconfigure(0, weight=1)
 
@@ -330,13 +330,16 @@ class App(tk.Tk):
 
         tree_wrap = ttk.Frame(tf)
         tree_wrap.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(tree_wrap, columns=("format", "length", "status"), selectmode="browse")
+        self.tree = ttk.Treeview(tree_wrap, columns=("format", "folder", "length", "status"),
+                                 selectmode="browse")
         self.tree.heading("#0", text="Video / playlist   (click to check / uncheck)")
         self.tree.heading("format", text="Format")
+        self.tree.heading("folder", text="Folder")
         self.tree.heading("length", text="Length")
         self.tree.heading("status", text="Status")
         s = self.scale
-        self.tree.column("#0", width=int(520 * s), stretch=True)
+        self.tree.column("#0", width=int(450 * s), stretch=True)
+        self.tree.column("folder", width=int(80 * s), anchor="center", stretch=False)
         self.tree.column("format", width=int(110 * s), anchor="center", stretch=False)
         self.tree.column("length", width=int(80 * s), anchor="e", stretch=False)
         self.tree.column("status", width=int(170 * s), anchor="center", stretch=False)
@@ -695,7 +698,7 @@ class App(tk.Tk):
                                        filetypes=[("Text files", "*.txt *.csv *.json"), ("All files", "*.*")])
         if f:
             try:
-                text = Path(f).read_text("utf-8", errors="replace")
+                text = core.read_text_file(f)
             except OSError as e:
                 messagebox.showerror(APP_NAME, f"Couldn't read the file:\n{e}")
                 return
@@ -703,25 +706,27 @@ class App(tk.Tk):
             self._load_links()
 
     def _load_links(self, auto: bool = False) -> int:
-        urls = core.extract_urls(self.links_txt.get("1.0", "end"))
-        if not urls:
+        rows = core.parse_links(self.links_txt.get("1.0", "end"))
+        if not rows:
             if not auto:
                 messagebox.showinfo(APP_NAME, "Paste one or more YouTube links in the box first.")
             return 0
-        known = {L["url"] for L in self.links.values()}
+        known = {(L["url"], L["folder"]) for L in self.links.values()}
         added = 0
-        for url in urls:
-            if url in known:
+        for url, folder in rows:
+            if (url, folder) in known:
                 continue
-            iid = self.tree.insert("", "end", text="  Reading link…", values=("", "", "Loading…"),
+            iid = self.tree.insert("", "end", text="  Reading link…", values=("", folder or "", "", "Loading…"),
                                    tags=("link", "muted"), image=self.imgs["none"])
             self.links[iid] = {"url": url, "info": None, "mode": self.mode_var.get(), "touched": False,
-                               "state": "loading"}
+                               "state": "loading", "folder": folder}
             threading.Thread(target=self._analyse_worker, args=(iid, url), daemon=True).start()
             added += 1
         self.links_txt.delete("1.0", "end")
         if added:
-            self._log(f"Reading {added} link{'s' if added > 1 else ''}…", "muted")
+            folders = sorted({f for _, f in rows if f}, key=lambda x: (len(x), x))
+            extra = f" for folder{'s' if len(folders) > 1 else ''} {', '.join(folders)}" if folders else ""
+            self._log(f"Reading {added} link{'s' if added > 1 else ''}{extra}…", "muted")
             self.auto_start = self.auto_start or auto
         elif not auto:
             self._log("Those links are already in the list.", "muted")
@@ -742,7 +747,7 @@ class App(tk.Tk):
         L = self.links[iid]
         if error:
             L["state"] = "error"
-            self.tree.item(iid, text=f"  {L['url']}", values=("", "", "✗ Couldn't read"),
+            self.tree.item(iid, text=f"  {L['url']}", values=("", L["folder"] or "", "", "✗ Couldn't read"),
                            tags=("link", "failed"), image=self.imgs["none"])
             self._log(f"✗ Couldn't read {L['url']}\n    {error}", "err")
             if hint := core.hint_for(error):
@@ -753,10 +758,10 @@ class App(tk.Tk):
                 single = info.get("single_id")
                 big = info["count"] > 25
                 self.tree.item(iid, text=f"  {info['title']}", tags=("link",),
-                               values=("", f"{info['count']} items", ""), open=bool(single) or not big)
+                               values=("", L["folder"] or "", f"{info['count']} items", ""), open=bool(single) or not big)
                 for e in info["entries"]:
                     cid = self.tree.insert(iid, "end", text=f"  {e['index']:>3}.  {e['title']}",
-                                           values=("", core.fmt_duration(e.get("duration")), ""))
+                                           values=("", "", core.fmt_duration(e.get("duration")), ""))
                     self.child_of[cid] = (iid, e)
                     if not single or e.get("id") == single:
                         self.checked.add(cid)
@@ -768,7 +773,7 @@ class App(tk.Tk):
                 self._log(f"✓ Loaded {what}.", "ok")
             else:
                 self.tree.item(iid, text=f"  {info['title']}", tags=("link",),
-                               values=("", core.fmt_duration(info.get("duration")), ""))
+                               values=("", L["folder"] or "", core.fmt_duration(info.get("duration")), ""))
                 self.checked.add(iid)
                 self._log(f"✓ Loaded '{info['title']}'.", "ok")
         self._refresh_check(iid)
@@ -827,6 +832,9 @@ class App(tk.Tk):
             return None                    # let the expand/collapse arrow work
         if col == "#1" and iid in self.links:
             self._set_link_mode(iid, None)
+            return "break"
+        if col == "#2" and iid in self.links:
+            self._ask_folder(iid)
             return "break"
         if col == "#0":
             self.tree.selection_set(iid)
@@ -929,12 +937,32 @@ class App(tk.Tk):
             m.add_command(label="Download this link as Audio", state=state,
                           command=lambda: self._set_link_mode(link, "audio"))
             m.add_separator()
+        if L:
+            m.add_command(label="Set folder…", state=state, command=lambda: self._ask_folder(link))
+            if L.get("folder"):
+                m.add_command(label="Clear folder", state=state, command=lambda: self._set_folder(link, None))
+            m.add_separator()
         url = L["url"] if iid == link else self._entry_url(iid)
         m.add_command(label="Copy link", command=lambda: (self.clipboard_clear(), self.clipboard_append(url)))
         m.add_command(label="Open in browser", command=lambda: webbrowser.open(url))
         m.add_separator()
         m.add_command(label="Remove from list", command=lambda: self._remove_link(link), state=state)
         m.tk_popup(ev.x_root, ev.y_root)
+
+    def _ask_folder(self, link):
+        if self.downloading or link not in self.links:
+            return
+        L = self.links[link]
+        name = simpledialog.askstring(
+            APP_NAME, "Save this link's videos in which folder?\n"
+                      "(e.g. 1, 2 or Songs - leave empty for the main folder)",
+            initialvalue=L.get("folder") or "", parent=self)
+        if name is not None:
+            self._set_folder(link, core.clean_folder(name))
+
+    def _set_folder(self, link, folder):
+        self.links[link]["folder"] = folder
+        self.tree.set(link, "folder", folder or "")
 
     def _entry_url(self, cid) -> str:
         link, e = self.child_of[cid]
@@ -969,7 +997,8 @@ class App(tk.Tk):
             info, mode = L["info"], L["mode"]
             if info["kind"] == "video":
                 if lid in self.checked:
-                    plans.append({"link": lid, "task": core.Task(L["url"], mode, title=info["title"]),
+                    plans.append({"link": lid, "task": core.Task(L["url"], mode, title=info["title"],
+                                                               subfolder=L["folder"]),
                                   "rows": [lid], "by_index": {}, "by_id": {info.get("id"): lid}, "single": lid})
                 continue
             kids = [c for c in self.tree.get_children(lid) if c in self.checked]
@@ -978,12 +1007,14 @@ class App(tk.Tk):
             entries = [self.child_of[c][1] for c in kids]
             single = info.get("single_id")
             if single and len(kids) == 1 and entries[0].get("id") == single:
-                task = core.Task(L["url"], mode, noplaylist=True, title=entries[0]["title"])
+                task = core.Task(L["url"], mode, noplaylist=True, title=entries[0]["title"],
+                                 subfolder=L["folder"])
                 plans.append({"link": lid, "task": task, "rows": kids, "by_index": {}, "by_id": {single: kids[0]},
                               "single": kids[0]})
                 continue
             items = None if len(kids) == info["count"] else core.compress_ranges(e["index"] for e in entries)
-            plans.append({"link": lid, "task": core.Task(L["url"], mode, items=items, title=info["title"]),
+            plans.append({"link": lid, "task": core.Task(L["url"], mode, items=items, title=info["title"],
+                                                                 subfolder=L["folder"]),
                           "rows": kids, "by_index": {e["index"]: c for e, c in zip(entries, kids)},
                           "by_id": {e.get("id"): c for e, c in zip(entries, kids) if e.get("id")}, "single": None})
         return plans
