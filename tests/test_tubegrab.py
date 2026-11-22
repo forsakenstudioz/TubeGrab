@@ -55,6 +55,13 @@ def test_folder_column_found_by_header_and_other_separators():
                                                                  ("https://youtu.be/b", None)]
 
 
+def test_semicolon_inside_a_title_does_not_break_the_row():
+    text = ('Folder no,Video No,Video Title,YouTube Link,Note\n'
+            '3,8,Part 2; revision,https://youtu.be/waL-wFNi_mE,\n'
+            '15,1,"MATHS - TEST, part 1",https://youtu.be/KVDXXXCwnKY,Same video as course 16\n')
+    assert core.parse_links(text) == [("https://youtu.be/waL-wFNi_mE", "3"), ("https://youtu.be/KVDXXXCwnKY", "15")]
+
+
 def test_folder_names_are_made_safe():
     assert core.clean_folder("1.0") == "1"
     assert core.clean_folder(" .. ") is None

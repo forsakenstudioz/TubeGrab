@@ -187,14 +187,22 @@ def clean_folder(name) -> str | None:
     return s[:80]
 
 
-def _cells(line: str) -> list[str]:
-    for delim in ("\t", ";", ","):
-        if delim in line:
+def _cells(line: str, delim: str | None = None) -> list[str]:
+    for d in ([delim] if delim else ["\t", ";", ","]):
+        if d in line:
             try:
-                return [c.strip() for c in next(csv.reader([line], delimiter=delim, skipinitialspace=True))]
+                return [c.strip() for c in next(csv.reader([line], delimiter=d, skipinitialspace=True))]
             except (csv.Error, StopIteration):
                 break
     return [line.strip()]
+
+
+def _file_delimiter(first_line: str) -> str | None:
+    """The separator a CSV uses, judged from its first line (so a ';' inside a title can't confuse it)."""
+    outside_quotes = re.sub(r'"[^"]*"', "", first_line)
+    counts = {d: outside_quotes.count(d) for d in ("\t", ";", ",")}
+    best = max(counts, key=counts.get)
+    return best if counts[best] else None
 
 
 def parse_links(text: str) -> list[tuple[str, str | None]]:
@@ -206,10 +214,10 @@ def parse_links(text: str) -> list[tuple[str, str | None]]:
     """
     out: list[tuple[str, str | None]] = []
     folder_col = None
-    for line in (text or "").lstrip("\ufeff").splitlines():
-        if not line.strip():
-            continue
-        cells = _cells(line)
+    lines = [ln for ln in (text or "").lstrip("\ufeff").splitlines() if ln.strip()]
+    delim = _file_delimiter(lines[0]) if lines else None
+    for line in lines:
+        cells = _cells(line, delim)
         url_cells = [i for i, c in enumerate(cells) if _URL.search(c)]
         if not url_cells:                               # header row (or junk)
             for i, c in enumerate(cells):
