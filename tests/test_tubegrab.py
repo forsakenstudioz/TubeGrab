@@ -62,6 +62,26 @@ def test_semicolon_inside_a_title_does_not_break_the_row():
     assert core.parse_links(text) == [("https://youtu.be/waL-wFNi_mE", "3"), ("https://youtu.be/KVDXXXCwnKY", "15")]
 
 
+def test_video_number_column_is_read():
+    text = ("Folder no,Video No,Video Title,YouTube Link,Note\n"
+            "3,1,Intro,https://youtu.be/Os-FdeE6dhg,\n"
+            "3,2,Intro again,https://youtu.be/Os-FdeE6dhg,Repeat of video 1\n"
+            "3,8,Part 2,https://youtu.be/waL-wFNi_mE,\n")
+    assert core.parse_link_rows(text) == [
+        {"url": "https://youtu.be/Os-FdeE6dhg", "folder": "3", "number": 1},
+        {"url": "https://youtu.be/waL-wFNi_mE", "folder": "3", "number": 8}]
+    assert core.parse_link_rows("Note,link\nhello,https://youtu.be/a")[0]["number"] is None   # "Note" isn't "No"
+    assert core.number_prefix(8, 15) == "08" and core.number_prefix(7, 125) == "007" and core.number_prefix(None, 9) is None
+
+
+def test_preview_names_match_the_download_template():
+    s = dict(core.DEFAULTS, download_dir="/x/TubeGrab")
+    namer = core.FileNamer(s)
+    assert namer.path("video", "3", "sollum porulum  2", "waL-wFNi_mE", prefix="08").as_posix() == \
+        "3/08 - sollum porulum  2 [waL-wFNi_mE].mp4"
+    assert namer.path("audio", "3", "A/B: why?", "abc").as_posix() == "3/Audio/A⧸B： why？ [abc].mp3"
+
+
 def test_folder_names_are_made_safe():
     assert core.clean_folder("1.0") == "1"
     assert core.clean_folder(" .. ") is None
@@ -162,18 +182,22 @@ def test_end_to_end_videos_go_into_their_folders():
     base = f"http://127.0.0.1:{server.server_address[1]}"
     out = TMP / "foldered"
     s = dict(core.DEFAULTS, download_dir=str(out), embed_thumbnail=False)
-    rows = core.parse_links(f"link,folder\n{base}/a.mp4,1\n{base}/b.mp4,2\n{base}/a.mp4,2\n")
+    rows = core.parse_link_rows(f"Folder,No,link\n1,1,{base}/a.mp4\n2,1,{base}/b.mp4\n2,2,{base}/a.mp4\n")
+    namer = core.FileNamer(s)
     try:
-        for url, folder in rows:
-            r = core.download(core.Task(url, "video", subfolder=folder), s, lambda k, d: None)
+        for r0 in rows:
+            prefix = core.number_prefix(r0["number"], 2)
+            r = core.download(core.Task(r0["url"], "video", subfolder=r0["folder"], prefix=prefix), s, lambda k, d: None)
             assert r.status == "done" and r.files, r.errors
+            vid = r0["url"].rsplit("/", 1)[1][:-4]
+            assert Path(r.files[0]) == out / namer.path("video", r0["folder"], vid, vid, prefix=prefix)
         r = core.download(core.Task(f"{base}/b.mp4", "audio", subfolder="2"), s, lambda k, d: None)
         assert r.status == "done", r.errors
     finally:
         server.shutdown()
-    assert (out / "1" / "a [a].mp4").is_file()
-    assert (out / "2" / "b [b].mp4").is_file()
-    assert (out / "2" / "a [a].mp4").is_file()          # same video in a second folder is not skipped
+    assert (out / "1" / "01 - a [a].mp4").is_file()
+    assert (out / "2" / "01 - b [b].mp4").is_file()
+    assert (out / "2" / "02 - a [a].mp4").is_file()     # same video in a second folder is not skipped
     assert (out / "2" / "Audio" / "b [b].mp3").is_file()
     opts = core.build_opts(core.Task("https://youtu.be/x", subfolder="1"), s)
     assert "playlist_title" not in opts["outtmpl"]["default"]          # playlist videos go straight into "1"

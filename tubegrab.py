@@ -164,7 +164,12 @@ class App(tk.Tk):
         self.links: dict = {}        # link iid -> {"url", "info", "mode", "touched", "state"}
         self.child_of: dict = {}     # child iid -> (link iid, entry)
         self.checked: set = set()    # leaf iids (video link rows and playlist item rows)
-        self.analyse_slots = threading.Semaphore(3)
+        self.folder_nodes: dict = {} # CSV folder name -> its heading row in the list
+        self._folder_iids: set = set()
+        self._summary_due = False
+        self.analyse_q: queue.Queue = queue.Queue()   # links waiting to be read, handled by 3 workers
+        for _ in range(3):
+            threading.Thread(target=self._analyse_loop, daemon=True).start()
         self.auto_start = False
 
         # download state
@@ -325,6 +330,7 @@ class App(tk.Tk):
         ttk.Button(bar, text="Collapse all", command=lambda: self._expand_all(False)).pack(side="left", padx=4)
         self.btn_clear = ttk.Button(bar, text="Clear list", command=self._clear_list)
         self.btn_clear.pack(side="left", padx=(12, 0))
+        ttk.Button(bar, text="Preview structure…", command=self._preview_structure).pack(side="left", padx=(12, 0))
         self.summary_lbl = ttk.Label(bar, text="Paste links above to begin.", style="Muted.TLabel")
         self.summary_lbl.pack(side="right")
 
@@ -494,6 +500,7 @@ class App(tk.Tk):
         for m in (self.menu, self.log_menu):
             m.configure(bg=p["panel"], fg=p["fg"], activebackground=p["select"], activeforeground=p["fg"])
         self.tree.tag_configure("link", font=(base_font[0], base_font[1], "bold"))
+        self.tree.tag_configure("folder", font=(base_font[0], base_font[1], "bold"), foreground=p["accent"])
         self.tree.tag_configure("failed", foreground=p["err"])
         self.tree.tag_configure("done", foreground=p["ok"])
         self.tree.tag_configure("muted", foreground=p["muted"])
@@ -706,25 +713,28 @@ class App(tk.Tk):
             self._load_links()
 
     def _load_links(self, auto: bool = False) -> int:
-        rows = core.parse_links(self.links_txt.get("1.0", "end"))
+        rows = [(r["url"], r["folder"], r["number"]) for r in core.parse_link_rows(self.links_txt.get("1.0", "end"))]
         if not rows:
             if not auto:
                 messagebox.showinfo(APP_NAME, "Paste one or more YouTube links in the box first.")
             return 0
         known = {(L["url"], L["folder"]) for L in self.links.values()}
         added = 0
-        for url, folder in rows:
+        for url, folder, number in rows:
             if (url, folder) in known:
                 continue
-            iid = self.tree.insert("", "end", text="  Reading link…", values=("", folder or "", "", "Loading…"),
+            iid = self.tree.insert(self._folder_node(folder) if folder else "", "end", text="  Reading link…",
+                                   values=("", folder or "", "", "Loading…"),
                                    tags=("link", "muted"), image=self.imgs["none"])
             self.links[iid] = {"url": url, "info": None, "mode": self.mode_var.get(), "touched": False,
-                               "state": "loading", "folder": folder}
-            threading.Thread(target=self._analyse_worker, args=(iid, url), daemon=True).start()
+                               "state": "loading", "folder": folder, "number": number}
+            self.analyse_q.put((iid, url))
             added += 1
         self.links_txt.delete("1.0", "end")
+        for node in self.folder_nodes.values():
+            self._refresh_folder(node)
         if added:
-            folders = sorted({f for _, f in rows if f}, key=lambda x: (len(x), x))
+            folders = sorted({f for _, f, _n in rows if f}, key=self._folder_key)
             extra = f" for folder{'s' if len(folders) > 1 else ''} {', '.join(folders)}" if folders else ""
             self._log(f"Reading {added} link{'s' if added > 1 else ''}{extra}…", "muted")
             self.auto_start = self.auto_start or auto
@@ -733,11 +743,13 @@ class App(tk.Tk):
         self._refresh_summary()
         return added
 
-    def _analyse_worker(self, iid, url):
-        with self.analyse_slots:
-            settings = dict(self.cfg)
+    def _analyse_loop(self):
+        while True:
+            iid, url = self.analyse_q.get()
+            if iid not in self.links:          # removed from the list while waiting
+                continue
             try:
-                self.q.put(("analysed", iid, core.analyze(url, settings), None))
+                self.q.put(("analysed", iid, core.analyze(url, dict(self.cfg)), None))
             except Exception as e:  # noqa: BLE001
                 self.q.put(("analysed", iid, None, core.clean_error(e)))
 
@@ -757,7 +769,7 @@ class App(tk.Tk):
             if info["kind"] == "playlist":
                 single = info.get("single_id")
                 big = info["count"] > 25
-                self.tree.item(iid, text=f"  {info['title']}", tags=("link",),
+                self.tree.item(iid, text=f"  {self._num_label(L)}{info['title']}", tags=("link",),
                                values=("", L["folder"] or "", f"{info['count']} items", ""), open=bool(single) or not big)
                 for e in info["entries"]:
                     cid = self.tree.insert(iid, "end", text=f"  {e['index']:>3}.  {e['title']}",
@@ -772,7 +784,7 @@ class App(tk.Tk):
                     what += " - only the video you opened is checked; tick more if you want them"
                 self._log(f"✓ Loaded {what}.", "ok")
             else:
-                self.tree.item(iid, text=f"  {info['title']}", tags=("link",),
+                self.tree.item(iid, text=f"  {self._num_label(L)}{info['title']}", tags=("link",),
                                values=("", L["folder"] or "", core.fmt_duration(info.get("duration")), ""))
                 self.checked.add(iid)
                 self._log(f"✓ Loaded '{info['title']}'.", "ok")
@@ -784,8 +796,82 @@ class App(tk.Tk):
             if self._leaf_count(checked_only=True):
                 self._start_download()
 
+    # =========================================================================== folders
+    @staticmethod
+    def _folder_key(name: str):
+        return (0, int(name), "") if name.isdigit() else (1, 0, name.lower())
+
+    def _folder_node(self, folder: str) -> str:
+        """The 'Folder 3' heading row, created in number order the first time it's needed."""
+        if folder in self.folder_nodes:
+            return self.folder_nodes[folder]
+        index = "end"
+        for i, top in enumerate(self.tree.get_children("")):
+            other = self._folder_name(top)
+            if other is None or self._folder_key(other) > self._folder_key(folder):
+                index = i
+                break
+        node = self.tree.insert("", index, text=f"  Folder {folder}", values=("", folder, "", ""),
+                                tags=("folder",), image=self.imgs["none"], open=False)
+        self.folder_nodes[folder] = node
+        self._folder_iids.add(node)
+        return node
+
+    def _num_label(self, L) -> str:
+        p = self._prefix(L)
+        return f"{p}.  " if p else ""
+
+    def _prefix(self, L) -> str | None:
+        """The CSV video number, padded to the size of the folder's biggest number ('08' of 35)."""
+        if L.get("number") is None:
+            return None
+        largest = max((o["number"] or 0) for o in self.links.values() if o["folder"] == L["folder"])
+        return core.number_prefix(L["number"], largest)
+
+    def _folder_name(self, iid):
+        return next((f for f, n in self.folder_nodes.items() if n == iid), None)
+
+    def _is_folder(self, iid) -> bool:
+        return iid in self._folder_iids
+
+    def _links_in_order(self) -> list:
+        out = []
+        for top in self.tree.get_children(""):
+            out.extend(self.tree.get_children(top) if self._is_folder(top) else [top])
+        return [lid for lid in out if lid in self.links]
+
+    def _refresh_folder(self, node):
+        if not self.tree.exists(node):
+            return
+        kids = [k for k in self.tree.get_children(node) if k in self.links]
+        leaves = [x for k in kids for x in self._leaves(k)]
+        n = sum(1 for x in leaves if x in self.checked)
+        state = "none" if not leaves else "on" if n == len(leaves) else "off" if n == 0 else "partial"
+        self.tree.item(node, image=self.imgs[state])
+        loading = sum(1 for k in kids if self.links[k]["state"] == "loading")
+        txt = "reading…" if loading else f"{len(leaves)} video{'s' if len(leaves) != 1 else ''}"
+        self.tree.set(node, "length", txt)
+
+    def _folder_status(self, node):
+        """'12 of 35 done' on a folder heading while downloading."""
+        leaves = [x for k in self.tree.get_children(node) if k in self.links for x in self._leaves(k)
+                  if x in self.checked]
+        if not leaves:
+            return
+        st = [self.tree.set(x, "status") for x in leaves]
+        ok = st.count("✓ Done") + st.count("Already have")
+        bad = st.count("✗ Failed") + st.count("Not downloaded")
+        txt = f"✓ {ok} of {len(leaves)} done" if ok == len(leaves) else f"{ok} of {len(leaves)} done"
+        if bad:
+            txt += f", {bad} failed"
+        self.tree.set(node, "status", txt)
+        if ok + bad == len(leaves):
+            self.tree.item(node, tags=("folder", "failed" if bad else "done"))
+
     # =========================================================================== checkboxes
     def _leaves(self, iid) -> list:
+        if self._is_folder(iid):
+            return [x for k in self.tree.get_children(iid) if k in self.links for x in self._leaves(k)]
         L = self.links.get(iid)
         if L is None:
             return [iid]
@@ -809,8 +895,25 @@ class App(tk.Tk):
         if self.links[link_iid]["info"]["kind"] == "playlist":
             for c in leaves:
                 self.tree.item(c, image=self.imgs["on" if c in self.checked else "off"])
+        parent = self.tree.parent(link_iid)
+        if parent and self._is_folder(parent) and not getattr(self, "_bulk", False):
+            self._refresh_folder(parent)
 
     def _toggle(self, iid):
+        if self._is_folder(iid):
+            targets = self._leaves(iid)
+            if not targets:
+                return
+            turn_on = not all(t in self.checked for t in targets)
+            for t in targets:
+                (self.checked.add if turn_on else self.checked.discard)(t)
+            self._bulk = True
+            for k in self.tree.get_children(iid):
+                self._refresh_check(k)
+            self._bulk = False
+            self._refresh_folder(iid)
+            self._refresh_summary()
+            return
         link = self.child_of[iid][0] if iid in self.child_of else iid
         if link not in self.links or self.links[link]["state"] != "ready":
             return
@@ -850,15 +953,19 @@ class App(tk.Tk):
     def _check_all(self, on: bool):
         if self.downloading:
             return
+        self._bulk = True
         for lid in self.links:
             for leaf in self._leaves(lid):
                 (self.checked.add if on else self.checked.discard)(leaf)
             self._refresh_check(lid)
+        self._bulk = False
+        for node in self.folder_nodes.values():
+            self._refresh_folder(node)
         self._refresh_summary()
 
     def _expand_all(self, open_: bool):
-        for lid in self.links:
-            self.tree.item(lid, open=open_)
+        for iid in list(self.folder_nodes.values()) + list(self.links):
+            self.tree.item(iid, open=open_)
 
     def _remove_link(self, iid):
         if self.downloading or iid not in self.links:
@@ -868,14 +975,34 @@ class App(tk.Tk):
             self.checked.discard(c)
         self.checked.discard(iid)
         self.links.pop(iid)
+        parent = self.tree.parent(iid)
         self.tree.delete(iid)
+        self._drop_empty_folder(parent)
         self._refresh_summary()
+
+    def _drop_empty_folder(self, node):
+        if node and self._is_folder(node):
+            if self.tree.get_children(node):
+                self._refresh_folder(node)
+            else:
+                self.folder_nodes.pop(self._folder_name(node), None)
+                self._folder_iids.discard(node)
+                self.tree.delete(node)
+
+    def _remove_folder(self, node):
+        if self.downloading:
+            return
+        for k in list(self.tree.get_children(node)):
+            self._remove_link(k)
 
     def _remove_selected(self):
         sel = self.tree.selection()
         if sel:
             iid = sel[0]
-            self._remove_link(self.child_of[iid][0] if iid in self.child_of else iid)
+            if self._is_folder(iid):
+                self._remove_folder(iid)
+            else:
+                self._remove_link(self.child_of[iid][0] if iid in self.child_of else iid)
 
     def _clear_list(self):
         if self.downloading:
@@ -906,6 +1033,13 @@ class App(tk.Tk):
                 self.tree.set(lid, "format", self._format_label(L["mode"]))
 
     def _refresh_summary(self):
+        """Recount once the current burst of changes is done (big lists change a lot at once)."""
+        if not self._summary_due:
+            self._summary_due = True
+            self.after(60, self._refresh_summary_now)
+
+    def _refresh_summary_now(self):
+        self._summary_due = False
         n_links = len(self.links)
         if not n_links:
             self.summary_lbl.config(text="Paste links above to begin.")
@@ -913,6 +1047,8 @@ class App(tk.Tk):
         loading = sum(1 for L in self.links.values() if L["state"] == "loading")
         total, chk = self._leaf_count(), self._leaf_count(checked_only=True)
         txt = f"{n_links} link{'s' if n_links > 1 else ''}  ·  {chk} of {total} items checked"
+        if self.folder_nodes:
+            txt += f"  ·  {len(self.folder_nodes)} folder{'s' if len(self.folder_nodes) > 1 else ''}"
         if loading:
             txt += f"  ·  reading {loading}…"
         self.summary_lbl.config(text=txt)
@@ -924,11 +1060,22 @@ class App(tk.Tk):
         if not iid:
             return
         self.tree.selection_set(iid)
-        link = self.child_of[iid][0] if iid in self.child_of else iid
-        L = self.links.get(link)
         m = self.menu
         m.delete(0, "end")
         state = "disabled" if self.downloading else "normal"
+        if self._is_folder(iid):
+            name = self._folder_name(iid)
+            m.add_command(label=f"Check / uncheck folder {name}", command=lambda: self._toggle(iid), state=state)
+            m.add_command(label="Download this folder as Video", state=state,
+                          command=lambda: [self._set_link_mode(k, "video") for k in self.tree.get_children(iid)])
+            m.add_command(label="Download this folder as Audio", state=state,
+                          command=lambda: [self._set_link_mode(k, "audio") for k in self.tree.get_children(iid)])
+            m.add_separator()
+            m.add_command(label="Remove folder from list", command=lambda: self._remove_folder(iid), state=state)
+            m.tk_popup(ev.x_root, ev.y_root)
+            return
+        link = self.child_of[iid][0] if iid in self.child_of else iid
+        L = self.links.get(link)
         if L and L["state"] == "ready":
             m.add_command(label="Check / uncheck", command=lambda: self._toggle(iid), state=state)
             m.add_separator()
@@ -961,12 +1108,176 @@ class App(tk.Tk):
             self._set_folder(link, core.clean_folder(name))
 
     def _set_folder(self, link, folder):
+        old_parent = self.tree.parent(link)
         self.links[link]["folder"] = folder
         self.tree.set(link, "folder", folder or "")
+        new_parent = self._folder_node(folder) if folder else ""
+        if new_parent != old_parent:
+            self.tree.move(link, new_parent, "end")
+            self._drop_empty_folder(old_parent)
+            if new_parent:
+                self._refresh_folder(new_parent)
+                self.tree.item(new_parent, open=True)
+            self.tree.see(link)
+        self._refresh_summary()
 
     def _entry_url(self, cid) -> str:
         link, e = self.child_of[cid]
         return f"https://www.youtube.com/watch?v={e['id']}" if e.get("id") else self.links[link]["url"]
+
+    # =========================================================================== preview
+    def _preview_structure(self):
+        """Show the folders and exact file names a download of the checked items will create."""
+        if core.parse_link_rows(self.links_txt.get("1.0", "end")):
+            self._load_links()
+        if not self.links:
+            messagebox.showinfo(APP_NAME, "Paste links or import a CSV first.")
+            return
+        self._save_cfg()
+        settings = dict(self.cfg)
+        jobs, pending = [], []
+        for lid in self._links_in_order():
+            L = self.links[lid]
+            if L["state"] == "loading":
+                pending.append(L)
+                continue
+            if L["state"] != "ready":
+                continue
+            info, base = L["info"], dict(mode=L["mode"], subfolder=L["folder"], prefix=self._prefix(L))
+            if info["kind"] == "video":
+                if lid in self.checked:
+                    jobs.append(base | dict(title=info["title"], video_id=info.get("id")))
+                continue
+            kids = [c for c in self.tree.get_children(lid) if c in self.checked]
+            entries = [self.child_of[c][1] for c in kids]
+            single = info.get("single_id")
+            if single and len(entries) == 1 and entries[0].get("id") == single:
+                jobs.append(base | dict(title=entries[0]["title"], video_id=single))
+                continue
+            for e in entries:
+                jobs.append(base | dict(title=e["title"], video_id=e.get("id"), index=e["index"],
+                                        count=info["count"], playlist_title=info["title"]))
+
+        win = tk.Toplevel(self)
+        win.title("Preview - folders and file names")
+        win.transient(self)
+        win.configure(bg=self.pal["bg"])
+        w, h = int(820 * self.scale), int(620 * self.scale)
+        win.geometry(f"{w}x{h}+{self.winfo_rootx() + max(0, (self.winfo_width() - w) // 2)}"
+                     f"+{self.winfo_rooty() + 40}")
+        frm = ttk.Frame(win, padding=10)
+        frm.pack(fill="both", expand=True)
+        head = ttk.Label(frm, text="Working out file names…", style="Muted.TLabel")
+        head.pack(anchor="w")
+        self._preview_win = win
+        self._preview_parts = (frm, head, settings, pending)
+
+        def work():
+            try:
+                namer = core.FileNamer(settings)
+                paths = [(namer.path(**j), j) for j in jobs]
+                self.q.put(("preview", win, paths, None))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("preview", win, [], core.clean_error(e)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_preview(self, win, paths, error):
+        if not win.winfo_exists():
+            return
+        frm, head, settings, pending = self._preview_parts
+        if error:
+            head.config(text=f"Couldn't work out the names: {error}")
+            return
+        root_dir = settings["download_dir"]
+        dirs: dict = {}
+        where: dict = {}
+        for rel, j in paths:
+            parent = rel.parent
+            dirs.setdefault(parent, []).append(rel.name)
+            if j.get("video_id"):
+                where.setdefault(j["video_id"], set()).add(str(parent))
+        repeated = sum(1 for v in where.values() if len(v) > 1)
+        top = {p.parts[0] for p in dirs if p.parts}
+        parts = [f"{len(paths)} file{'s' if len(paths) != 1 else ''}"]
+        if top:
+            parts.append(f"in {len(top)} folder{'s' if len(top) != 1 else ''}")
+        if repeated:
+            parts.append(f"{repeated} video{'s' if repeated != 1 else ''} saved in more than one folder")
+        if pending:
+            parts.append(f"{len(pending)} link{'s' if len(pending) != 1 else ''} still being read (not shown)")
+        head.config(text="   ·   ".join(parts), style="TLabel")
+        ttk.Label(frm, text=f"Saved under:  {root_dir}", style="Muted.TLabel").pack(anchor="w", pady=(2, 6))
+
+        wrap = ttk.Frame(frm)
+        wrap.pack(fill="both", expand=True)
+        tv = ttk.Treeview(wrap, columns=("info",), selectmode="browse")
+        tv.heading("#0", text="Folder / file")
+        tv.heading("info", text="")
+        tv.column("#0", width=int(600 * self.scale), stretch=True)
+        tv.column("info", width=int(160 * self.scale), anchor="e", stretch=False)
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=sb.set)
+        tv.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        tv.tag_configure("dir", font=(ui_font()[0], ui_font()[1], "bold"))
+        tv.tag_configure("muted", foreground=self.pal["muted"])
+
+        nodes = {Path(): ""}
+        open_top = len(top) <= 3
+
+        def node_for(d: Path):
+            if d in nodes:
+                return nodes[d]
+            if d == d.parent:                       # safety net for odd absolute paths
+                return ""
+            parent = node_for(d.parent)
+            nodes[d] = tv.insert(parent, "end", text=f"  {d.name}", tags=("dir",),
+                                 open=open_top or len(d.parts) > 1)
+            return nodes[d]
+        for d in sorted(dirs, key=lambda d: [self._folder_key(x) for x in d.parts]):
+            node = node_for(d)
+            for name in dirs[d]:
+                tv.insert(node, "end", text=f"  {name}")
+            if d.parts:
+                tv.set(node, "info", f"{len(dirs[d])} file{'s' if len(dirs[d]) != 1 else ''}")
+        for d, node in nodes.items():                  # folders that only hold subfolders (e.g. Audio)
+            if d.parts and not tv.set(node, "info"):
+                n = sum(len(v) for k, v in dirs.items() if k.parts[:len(d.parts)] == d.parts)
+                tv.set(node, "info", f"{n} files")
+        for L in pending:
+            node = node_for(Path(L["folder"])) if L["folder"] else ""
+            tv.insert(node, "end", text=f"  (still reading)  {L['url']}", tags=("muted",))
+
+        def save_txt():
+            f = filedialog.asksaveasfilename(parent=win, defaultextension=".txt", initialfile="tubegrab-structure.txt",
+                                             filetypes=[("Text", "*.txt")])
+            if not f:
+                return
+            lines = [root_dir]
+
+            def walk(item, depth):
+                for c in tv.get_children(item):
+                    info = tv.set(c, "info")
+                    lines.append("    " * depth + tv.item(c, "text").strip() + (f"   ({info})" if info else ""))
+                    walk(c, depth + 1)
+            walk("", 1)
+            Path(f).write_text("\n".join(lines) + "\n", "utf-8")
+
+        bb = ttk.Frame(frm)
+        bb.pack(fill="x", pady=(8, 0))
+        ttk.Button(bb, text="Expand all", command=lambda: [tv.item(n, open=True) for n in nodes.values() if n]
+                   ).pack(side="left")
+        ttk.Button(bb, text="Collapse all", command=lambda: [tv.item(n, open=False) for n in nodes.values() if n]
+                   ).pack(side="left", padx=6)
+        ttk.Button(bb, text="Save as text…", command=save_txt).pack(side="left", padx=(6, 0))
+
+        def go():
+            win.destroy()
+            self._download_clicked()
+        ttk.Button(bb, text="Download checked", style="Accent.TButton", command=go,
+                   state="disabled" if self.downloading or not paths else "normal").pack(side="right")
+        ttk.Button(bb, text="Close", command=win.destroy).pack(side="right", padx=6)
+        win.bind("<Escape>", lambda e: win.destroy())
 
     # =========================================================================== downloading
     def _download_clicked(self):
@@ -990,7 +1301,7 @@ class App(tk.Tk):
 
     def _make_plans(self) -> list:
         plans = []
-        for lid in self.tree.get_children(""):
+        for lid in self._links_in_order():
             L = self.links[lid]
             if L["state"] != "ready":
                 continue
@@ -998,7 +1309,7 @@ class App(tk.Tk):
             if info["kind"] == "video":
                 if lid in self.checked:
                     plans.append({"link": lid, "task": core.Task(L["url"], mode, title=info["title"],
-                                                               subfolder=L["folder"]),
+                                                               subfolder=L["folder"], prefix=self._prefix(L)),
                                   "rows": [lid], "by_index": {}, "by_id": {info.get("id"): lid}, "single": lid})
                 continue
             kids = [c for c in self.tree.get_children(lid) if c in self.checked]
@@ -1008,13 +1319,13 @@ class App(tk.Tk):
             single = info.get("single_id")
             if single and len(kids) == 1 and entries[0].get("id") == single:
                 task = core.Task(L["url"], mode, noplaylist=True, title=entries[0]["title"],
-                                 subfolder=L["folder"])
+                                 subfolder=L["folder"], prefix=self._prefix(L))
                 plans.append({"link": lid, "task": task, "rows": kids, "by_index": {}, "by_id": {single: kids[0]},
                               "single": kids[0]})
                 continue
             items = None if len(kids) == info["count"] else core.compress_ranges(e["index"] for e in entries)
             plans.append({"link": lid, "task": core.Task(L["url"], mode, items=items, title=info["title"],
-                                                                 subfolder=L["folder"]),
+                                                                 subfolder=L["folder"], prefix=self._prefix(L)),
                           "rows": kids, "by_index": {e["index"]: c for e, c in zip(entries, kids)},
                           "by_id": {e.get("id"): c for e, c in zip(entries, kids) if e.get("id")}, "single": None})
         return plans
@@ -1040,6 +1351,9 @@ class App(tk.Tk):
                 self.tree.item(r, tags=self._row_tags(r))
             if p["rows"][0] != p["link"]:
                 self.tree.set(p["link"], "status", "Queued")
+        for node in self.folder_nodes.values():
+            self.tree.set(node, "status", "")
+            self.tree.item(node, tags=("folder",))
         self.cancel.clear()
         self.pause.clear()
         self._set_busy(True)
@@ -1136,6 +1450,8 @@ class App(tk.Tk):
 
     def _on_plan_done(self, i, result):
         plan = self.plans[i]
+        self.after_idle(lambda p=plan["link"]: self._folder_status(self.tree.parent(p))
+                        if self.tree.exists(p) and self._is_folder(self.tree.parent(p)) else None)
         leftover = "Stopped" if result.status == "cancelled" else "Not downloaded"
         for r in plan["rows"]:
             if r not in self.done_rows:
@@ -1256,11 +1572,18 @@ class App(tk.Tk):
                 kind = msg[0]
                 if kind == "analysed":
                     self._show_link(*msg[1:])
+                elif kind == "preview":
+                    self._show_preview(*msg[1:])
                 elif kind == "plan":
                     p = self.plans[msg[1]]
                     if p["rows"][0] != p["link"]:
                         self.tree.set(p["link"], "status", "Downloading…")
                         self.tree.item(p["link"], open=True)
+                    parent = self.tree.parent(p["link"])
+                    if self._is_folder(parent):
+                        self.tree.item(parent, open=True)
+                        if not self.tree.set(parent, "status"):
+                            self.tree.set(parent, "status", "Downloading…")
                 elif kind == "dl":
                     self._on_dl_event(*msg[1:])
                 elif kind == "plan_done":

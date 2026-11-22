@@ -1,5 +1,5 @@
-Link,Folder
-https://www.youtube.com/watch?v=VIDEO_ID_1,1
-https://www.youtube.com/watch?v=VIDEO_ID_2,1
-https://www.youtube.com/playlist?list=PLAYLIST_ID,2
-https://youtu.be/VIDEO_ID_3,Songs
+Folder no,Video No,Video Title,YouTube Link
+1,1,First lesson,https://www.youtube.com/watch?v=VIDEO_ID_1
+1,2,Second lesson,https://www.youtube.com/watch?v=VIDEO_ID_2
+2,1,A whole playlist,https://www.youtube.com/playlist?list=PLAYLIST_ID
+Songs,1,A song,https://youtu.be/VIDEO_ID_3

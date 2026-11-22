@@ -8,6 +8,14 @@
 - New **Folder** column in the list; click it or right-click a link to set or clear its folder
 - Playlists with a folder go straight into that folder (no extra playlist subfolder)
 - Download history is kept per folder, so the same video can be saved in two folders
+- **Video number in file names:** a "Video No" column puts the number in front of each file
+  (`08 - title [id].mp4`), zero-padded so files sort in course order
+- **See the structure before downloading:** the list groups links under folder headings (tick a heading to
+  select the whole folder), and **Preview structure…** shows every folder and exact file name, with totals
+  and a "Save as text" option
+- Folder headings show progress while downloading ("12 of 35 done")
+- Big lists load much faster (1,500+ links in under a second)
+- CSV separator is detected once per file, so a `;` inside a title can't break a row
 - Example file: `docs/example-links.csv`
 
 ## 1.1.0 - 2026-10-23

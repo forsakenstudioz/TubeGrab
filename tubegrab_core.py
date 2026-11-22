@@ -205,15 +205,25 @@ def _file_delimiter(first_line: str) -> str | None:
     return best if counts[best] else None
 
 
+_NUMBER_HEADER = re.compile(r"\b(no|number|num|sl|s\.?\s?no|order|#)\b|#", re.I)
+
+
 def parse_links(text: str) -> list[tuple[str, str | None]]:
+    """Like parse_link_rows(), as (url, folder) pairs."""
+    return [(r["url"], r["folder"]) for r in parse_link_rows(text)]
+
+
+def parse_link_rows(text: str) -> list[dict]:
     """
-    Read links (+ optional folder) from pasted text, a .txt or a .csv file.
+    Read links (+ optional folder and video number) from pasted text, a .txt or a .csv file.
     Each line may be just a link, or a row like  "link, folder"  (comma, semicolon or tab separated).
     A header row with a column named like "folder" picks that column; otherwise the first non-link
-    value on the row is the folder. Returns [(url, folder or None)], without duplicates.
+    value on the row is the folder. A header like "Video No" / "Number" gives each video a number
+    that goes in front of its file name. Returns [{"url", "folder", "number"}], without duplicates.
     """
-    out: list[tuple[str, str | None]] = []
-    folder_col = None
+    out: list[dict] = []
+    seen: set = set()
+    folder_col = number_col = None
     lines = [ln for ln in (text or "").lstrip("\ufeff").splitlines() if ln.strip()]
     delim = _file_delimiter(lines[0]) if lines else None
     for line in lines:
@@ -223,8 +233,14 @@ def parse_links(text: str) -> list[tuple[str, str | None]]:
             for i, c in enumerate(cells):
                 if "folder" in c.lower():
                     folder_col = i
+                elif number_col is None and _NUMBER_HEADER.search(c):
+                    number_col = i
             continue
         folder = None
+        number = None
+        if number_col is not None and number_col < len(cells) and number_col not in url_cells:
+            m = re.fullmatch(r"\s*(\d{1,6})(?:\.0+)?\s*", cells[number_col])
+            number = int(m.group(1)) if m else None
         if len(url_cells) == 1:
             if folder_col is not None and folder_col != url_cells[0] and folder_col < len(cells):
                 folder = clean_folder(cells[folder_col])
@@ -233,9 +249,17 @@ def parse_links(text: str) -> list[tuple[str, str | None]]:
                                if i != url_cells[0] and clean_folder(c)), None)
         for i in url_cells:
             for u in extract_urls(cells[i]):
-                if (u, folder) not in out:
-                    out.append((u, folder))
+                if (u, folder) not in seen:
+                    seen.add((u, folder))
+                    out.append({"url": u, "folder": folder, "number": number if len(url_cells) == 1 else None})
     return out
+
+
+def number_prefix(number: int | None, largest: int | None) -> str | None:
+    """CSV video number as a file-name prefix, zero-padded so files sort in order: 8 of 35 -> '08'."""
+    if number is None:
+        return None
+    return f"{number:0{max(2, len(str(largest or number)))}d}"
 
 
 def read_text_file(path) -> str:
@@ -367,6 +391,7 @@ class Task:
     noplaylist: bool = False
     title: str = ""
     subfolder: str | None = None    # save into download_dir/<subfolder> (from the CSV "folder" column)
+    prefix: str | None = None       # e.g. "08": the CSV video number, put in front of the file name
 
 
 @dataclass
@@ -418,6 +443,10 @@ def build_opts(task: Task, settings: dict) -> dict:
     name = "%(title)s [%(id)s].%(ext)s"
     if s["number_playlist_items"]:
         name = "%(playlist_index&{} - |)s" + name
+    if task.prefix:
+        if not re.fullmatch(r"\d{1,7}", task.prefix):
+            raise ValueError("Invalid video number.")
+        name = f"{task.prefix} - " + name
     if s["playlist_folder"] and not task.subfolder:   # a CSV folder already groups the videos
         name = "%(playlist_title|.)s/" + name
 
@@ -481,6 +510,40 @@ def build_opts(task: Task, settings: dict) -> dict:
         pps.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
     opts["postprocessors"] = pps
     return opts
+
+
+class FileNamer:
+    """Works out the exact file paths a download will create (using yt-dlp's own naming), for previews."""
+
+    def __init__(self, settings: dict):
+        self.settings = settings
+        self._ydls: dict = {}
+
+    def _ydl(self, mode: str, subfolder: str | None):
+        key = (mode, subfolder)
+        if key not in self._ydls:
+            opts = build_opts(Task("https://youtu.be/x", mode, subfolder=subfolder), self.settings)
+            self._ydls[key] = yt_dlp.YoutubeDL({k: opts[k] for k in ("outtmpl", "windowsfilenames")}
+                                               | {"quiet": True, "no_warnings": True, "logger": _QuietLogger()})
+        return self._ydls[key]
+
+    def path(self, mode: str, subfolder: str | None, title: str, video_id: str | None,
+             index: int | None = None, count: int | None = None, playlist_title: str | None = None,
+             prefix: str | None = None) -> Path:
+        """Path relative to the download folder, e.g. Path('3/sollum porulum 2 [waL-wFNi_mE].mp4')."""
+        s = self.settings
+        ext = s["audio_format"] if mode == "audio" else s["video_container"]
+        info = {"id": video_id or "unknown", "title": title or video_id or "video", "ext": ext}
+        if index is not None:
+            info.update(playlist_index=index, playlist_title=playlist_title or "Playlist",
+                        __last_playlist_index=count or index, playlist_count=count or index)
+        name = Path(self._ydl(mode, subfolder).prepare_filename(info))     # e.g. 'Playlist/1 - Title [id].mp4'
+        if prefix:
+            name = name.with_name(f"{prefix} - {name.name}")
+        folder = Path(clean_folder(subfolder) or "") if subfolder else Path()   # same layout as build_opts()
+        if mode == "audio":
+            folder = folder / "Audio"
+        return folder / name
 
 
 def download(task: Task, settings: dict, emit: Emit, cancel: threading.Event | None = None,

@@ -29,22 +29,26 @@ Videos are saved to `Downloads\TubeGrab`, audio to `Downloads\TubeGrab\Audio`.
 
 ### Sorting videos into folders (CSV)
 
-Make a CSV (in Excel: *Save as → CSV*) with a link column and a folder column, and open it with **Import .txt / .csv…**:
+Make a CSV (in Excel: *Save as → CSV UTF-8*) with a link column, a folder column and optionally a video number, then open it with **Import .txt / .csv…**:
 
-| Link | Folder |
-|---|---|
-| https://www.youtube.com/watch?v=… | 1 |
-| https://www.youtube.com/watch?v=… | 1 |
-| https://www.youtube.com/playlist?list=… | 2 |
+| Folder no | Video No | Video Title | YouTube Link |
+|---|---|---|---|
+| 1 | 1 | … | https://youtu.be/… |
+| 1 | 2 | … | https://youtu.be/… |
+| 3 | 8 | … | https://youtu.be/waL-wFNi_mE |
 
-Everything marked `1` is saved in `Downloads\TubeGrab\1`, everything marked `2` in `Downloads\TubeGrab\2`, and so on.
-Folder names can be numbers or words. Links without a folder go to the main folder. A playlist with a folder goes straight into that folder.
-Audio downloads go in an `Audio` subfolder inside the folder.
+That last row is saved as `Downloads\TubeGrab\3\08 - sollum porulum  2 [waL-wFNi_mE].mp4`:
+the video number (zero-padded so files sort in order), the YouTube title, and the video ID.
 
-- The folder column is found by its header (any header containing "folder"). Without a header, the first non-link value on each row is used.
-- You can also type or paste `link, folder` lines into box 1, or copy the two columns straight from Excel.
-- To change a link's folder later, click its **Folder** cell or right-click it → **Set folder…**.
-- See [`docs/example-links.csv`](docs/example-links.csv).
+- Columns are found by their header: anything with "folder" is the folder, "No" / "Number" is the video number. Other columns (title, notes) are ignored.
+- Folder names can be numbers or words. Links without a folder go to the main folder; a playlist with a folder goes straight into it.
+- A video listed twice in the same folder is downloaded once. The same video in two folders is saved in both.
+- Audio downloads go in an `Audio` subfolder inside the folder.
+- You can also type or paste `link, folder` lines into box 1, or copy the columns straight from Excel.
+
+**See the structure before downloading:** the list groups links under **Folder 1, Folder 2…** (tick a heading to select the whole folder),
+and **Preview structure…** shows every folder and the exact file names that will be created, with totals. It can also save them as a text file.
+To move a link to another folder, click its **Folder** cell or right-click → **Set folder…**. See [`docs/example-links.csv`](docs/example-links.csv).
 
 ## Settings
 
